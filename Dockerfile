@@ -9,9 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
-COPY pyproject.toml README.md ./
+COPY pyproject.toml README.md langgraph.json ./
 COPY app/ app/
-RUN pip install --no-cache-dir build && \
+RUN pip install --no-cache-dir build "langgraph-cli[inmem]" && \
     pip install --no-cache-dir .
 
 # Final stage
@@ -36,7 +36,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=8000
 
-EXPOSE 8000
+EXPOSE 2024
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
