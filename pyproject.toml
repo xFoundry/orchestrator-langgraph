@@ -7,6 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     # LangGraph v1 + LangChain v1
     "langgraph>=1.0.0",
+    "langgraph-cli[inmem]>=0.2.0",
     "langgraph-checkpoint-redis>=0.1.0",
 
     # LangChain v1 (create_agent replaces create_react_agent)

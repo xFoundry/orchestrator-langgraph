@@ -1963,3 +1963,12 @@ async def run_orchestrator_v3(
         "citations": result.get("citations", []),
         "retries_used": result.get("retry_count", 0),
     }
+
+
+# =============================================================================
+# LANGGRAPH SERVER ENTRY POINT
+# =============================================================================
+
+# Module-level graph instance for LangGraph Server
+# The server will handle checkpointing/persistence
+graph = create_orchestrator_v3()
