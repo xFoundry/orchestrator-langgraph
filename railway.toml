@@ -3,7 +3,7 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "sh -c \"langgraph dev --config ./langgraph.json --host 0.0.0.0 --port ${PORT:-2024} --no-reload --no-browser\""
+startCommand = "sh /app/start.sh"
 healthcheckPath = "/ok"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"

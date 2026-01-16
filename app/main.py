@@ -98,6 +98,12 @@ async def health() -> dict:
     return {"status": "healthy"}
 
 
+@app.get("/ok")
+async def ok() -> dict:
+    """Agent Server-compatible health check endpoint."""
+    return {"status": "ok"}
+
+
 @app.get("/live")
 async def liveness() -> dict:
     """Kubernetes liveness probe."""
