@@ -1781,6 +1781,53 @@ async def _emit_handoff_event_if_needed(state: OrchestratorV3State, final_messag
 
 
 # =============================================================================
+# PREPROCESSOR NODE (for LangGraph Server compatibility)
+# =============================================================================
+
+def preprocess_node(state: OrchestratorV3State) -> dict[str, Any]:
+    """
+    Preprocess input to extract query from messages.
+
+    This enables compatibility with standard LangGraph Server input format
+    which only sends messages, not a separate query field.
+    """
+    messages = state.get("messages", [])
+    query = state.get("query")
+
+    # If query not provided, extract from last human message
+    if not query and messages:
+        for msg in reversed(messages):
+            if hasattr(msg, "type") and msg.type == "human":
+                query = msg.content
+                break
+            elif hasattr(msg, "role") and msg.role == "user":
+                query = msg.content
+                break
+            elif isinstance(msg, HumanMessage):
+                query = msg.content
+                break
+
+    # Set defaults for optional fields
+    return {
+        "query": query or "",
+        "user_context": state.get("user_context"),
+        "canvas_id": state.get("canvas_id"),
+        "chat_block_id": state.get("chat_block_id"),
+        "auto_artifacts": state.get("auto_artifacts", False),
+        "context_artifacts": state.get("context_artifacts") or [],
+        "plan": None,
+        "planned_calls": [],
+        "tool_results": [],
+        "evaluation": None,
+        "retry_count": state.get("retry_count", 0),
+        "max_retries": state.get("max_retries", 2),
+        "final_answer": None,
+        "confidence": 0.0,
+        "citations": [],
+    }
+
+
+# =============================================================================
 # GRAPH BUILDER
 # =============================================================================
 
@@ -1814,14 +1861,16 @@ def create_orchestrator_v3(
     builder = StateGraph(OrchestratorV3State)
 
     # Add nodes
+    builder.add_node("preprocess", preprocess_node)
     builder.add_node("planner", planner_node)
     builder.add_node("tool_worker", tool_worker)
     builder.add_node("evaluator", evaluator_node)
     builder.add_node("increment_retry", increment_retry)
     builder.add_node("synthesizer", synthesizer_node)
 
-    # Entry: Start with planner
-    builder.add_edge(START, "planner")
+    # Entry: Start with preprocessor to extract query from messages
+    builder.add_edge(START, "preprocess")
+    builder.add_edge("preprocess", "planner")
 
     # Planner → Spawn parallel workers OR go to synthesizer for conversational queries
     builder.add_conditional_edges(
