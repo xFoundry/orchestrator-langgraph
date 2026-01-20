@@ -28,6 +28,9 @@ dependencies = [
     # Cognee Memory Integration
     "cognee-integration-langgraph>=0.1.0",
 
+    # Deep Agents (LangGraph agent harness)
+    "deepagents>=0.1.0",
+
     # Utilities
     "python-dotenv>=1.0.0",
     "python-json-logger>=2.0.7",

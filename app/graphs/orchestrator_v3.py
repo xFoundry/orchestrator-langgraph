@@ -36,6 +36,13 @@ from app.config import get_settings
 from app.tools.graph_tools import query_graph, search_text, find_entity, get_graph_schema
 from app.tools.cognee_tools import search_chunks, search_summaries, search_graph, search_rag
 from app.tools.mentor_hub_tools import get_mentor_hub_tools
+from app.tools.firecrawl_tools import (
+    firecrawl_scrape,
+    firecrawl_search,
+    firecrawl_map,
+    firecrawl_crawl,
+    firecrawl_extract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +88,7 @@ class OrchestratorV3State(TypedDict):
     chat_block_id: Optional[str]
     auto_artifacts: bool
     context_artifacts: list[dict[str, Any]]
+    selected_tools: list[str]
 
     # Planning
     plan: Optional[str]  # LLM's reasoning about what to do
@@ -164,9 +172,32 @@ These query the live application database for real-time information.
     - Best for: "What are DefenX's blockers?", task status, action items
     - Returns: Tasks with status, assignees, due dates
 
+### Web Research Tools (via Firecrawl)
+These scrape or search the live web. Use when the question needs external sources.
+
+11. **firecrawl_scrape(url, formats=['markdown'], only_main_content=True)**
+    - Best for: Scraping a specific URL the user provides
+    - Returns: Markdown + metadata for that page
+
+12. **firecrawl_search(query, limit=5)**
+    - Best for: Finding relevant public web pages for a query
+    - Returns: Search results (title, url, description)
+
+13. **firecrawl_map(url, limit?)**
+    - Best for: Listing URLs on a site to explore or scrape
+    - Returns: Discovered URLs
+
+14. **firecrawl_crawl(url, limit?, max_discovery_depth?)**
+    - Best for: Crawling a site to gather multiple pages
+    - Returns: Crawl job info (may be async)
+
+15. **firecrawl_extract(urls, prompt?, schema?)**
+    - Best for: Structured extraction from one or more pages
+    - Returns: Extracted structured data
+
 ### Memory Tools (if enabled)
-11. **remember(content)** - Store information for later
-12. **recall(query)** - Search stored memories
+16. **remember(content)** - Store information for later
+17. **recall(query)** - Search stored memories
 
 ## Strategy Guidelines
 
@@ -191,6 +222,12 @@ def get_all_tools() -> list:
         search_graph,
         search_rag,
         get_graph_schema,
+        # Firecrawl tools
+        firecrawl_scrape,
+        firecrawl_search,
+        firecrawl_map,
+        firecrawl_crawl,
+        firecrawl_extract,
     ]
     # Add Mentor Hub tools
     tools.extend(get_mentor_hub_tools())
@@ -208,6 +245,11 @@ def get_tool_by_name(name: str):
         "search_rag": search_rag,
         "get_graph_schema": get_graph_schema,
         "search_chunks": search_chunks,
+        "firecrawl_scrape": firecrawl_scrape,
+        "firecrawl_search": firecrawl_search,
+        "firecrawl_map": firecrawl_map,
+        "firecrawl_crawl": firecrawl_crawl,
+        "firecrawl_extract": firecrawl_extract,
     }
     # Add Mentor Hub tools
     for tool in get_mentor_hub_tools():
@@ -269,6 +311,46 @@ class PlannerOutput(BaseModel):
     tool_calls: list[dict] = Field(description="List of tool calls to execute")
 
 
+def _extract_first_url(text: str) -> Optional[str]:
+    match = re.search(r"https?://\S+", text)
+    if not match:
+        return None
+    url = match.group(0).rstrip(").,]")
+    return url
+
+
+def _ensure_selected_tools(
+    planned_calls: list[ToolCall],
+    selected_tools: list[str],
+    query: str,
+) -> list[ToolCall]:
+    """Ensure user-selected tool groups are represented in planned calls."""
+    if not selected_tools:
+        return planned_calls
+
+    normalized = {tool.strip().lower() for tool in selected_tools if tool.strip()}
+    updated_calls = list(planned_calls)
+
+    if "firecrawl" in normalized:
+        has_firecrawl = any(call["tool_name"].startswith("firecrawl_") for call in planned_calls)
+        if not has_firecrawl:
+            url = _extract_first_url(query)
+            tool_name = "firecrawl_scrape" if url else "firecrawl_search"
+            tool_args = {"url": url, "formats": ["markdown"], "only_main_content": True} if url else {
+                "query": query,
+                "limit": 5,
+            }
+            updated_calls.append(ToolCall(
+                id=f"forced_firecrawl_{uuid.uuid4().hex[:6]}",
+                tool_name=tool_name,
+                tool_args=tool_args,
+                priority="high",
+                rationale="User selected Firecrawl for this request",
+            ))
+
+    return updated_calls
+
+
 async def planner_node(state: OrchestratorV3State) -> dict[str, Any]:
     """
     LLM-driven planning node.
@@ -279,6 +361,7 @@ async def planner_node(state: OrchestratorV3State) -> dict[str, Any]:
     query = state["query"]
     user_context = state.get("user_context")
     context_artifacts = state.get("context_artifacts") or []
+    selected_tools = state.get("selected_tools") or []
     retry_count = state.get("retry_count", 0)
     previous_results = state.get("tool_results", [])
     previous_evaluation = state.get("evaluation")
@@ -326,10 +409,19 @@ Previous tool results summary:
     # Build the prompt
     system_prompt = PLANNER_SYSTEM_PROMPT.format(tool_descriptions=TOOL_DESCRIPTIONS)
 
+    tool_selection_note = ""
+    if selected_tools:
+        tool_list = ", ".join(selected_tools)
+        tool_selection_note = (
+            f"## User-Selected Tools\n"
+            f"The user explicitly selected: {tool_list}.\n"
+            "Include at least one call to each selected tool when possible.\n\n"
+        )
+
     user_prompt = f"""## User Context
 {context_section}
 
-## Query
+{tool_selection_note}## Query
 {query}
 
 {retry_section}
@@ -376,6 +468,8 @@ Now output your plan as JSON (no markdown code blocks):"""
                 priority=call.get("priority", "medium"),
                 rationale=call.get("rationale", ""),
             ))
+
+        planned_calls = _ensure_selected_tools(planned_calls, selected_tools, query)
 
         logger.info(f"Planner created {len(planned_calls)} tool calls for query: {query[:50]}...")
 
@@ -925,7 +1019,57 @@ async def synthesizer_node(state: OrchestratorV3State) -> dict[str, Any]:
 
         # Format based on tool type
         if isinstance(data, dict):
-            if "sessions" in data:
+            if tool_name == "firecrawl_search":
+                results = data.get("results", [])
+                results_text += f"Found {len(results)} web results:\n"
+                for item in results[:5]:
+                    if not isinstance(item, dict):
+                        results_text += f"- {str(item)[:200]}...\n"
+                        continue
+                    title = item.get("title") or item.get("url") or "Result"
+                    url = item.get("url")
+                    description = item.get("description") or ""
+                    line = f"- {title}"
+                    if url:
+                        line += f" ({url})"
+                    if description:
+                        line += f": {description[:200]}"
+                    results_text += f"{line}\n"
+            elif tool_name == "firecrawl_scrape":
+                results_text += f"Scraped URL: {data.get('url', 'Unknown')}\n"
+                metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+                title = metadata.get("title") or metadata.get("og:title")
+                if title:
+                    results_text += f"Title: {title}\n"
+                summary = data.get("summary")
+                markdown = data.get("markdown")
+                if summary:
+                    results_text += f"Summary: {summary[:400]}\n"
+                elif markdown:
+                    results_text += f"Content: {markdown[:500]}...\n"
+                links = data.get("links")
+                if isinstance(links, list):
+                    results_text += f"Links: {len(links)}\n"
+            elif tool_name == "firecrawl_map":
+                urls = data.get("urls") if isinstance(data.get("urls"), list) else []
+                results_text += f"Found {len(urls)} URLs:\n"
+                for url in urls[:10]:
+                    results_text += f"- {url}\n"
+            elif tool_name == "firecrawl_extract":
+                results = data.get("results")
+                if isinstance(results, list):
+                    results_text += f"Extracted {len(results)} items:\n"
+                    for item in results[:5]:
+                        results_text += f"- {json.dumps(item, ensure_ascii=True)[:200]}...\n"
+                elif isinstance(results, dict):
+                    results_text += "Extracted data:\n"
+                    results_text += f"{json.dumps(results, ensure_ascii=True)[:500]}...\n"
+                else:
+                    results_text += f"{str(results)[:500]}...\n"
+            elif tool_name == "firecrawl_crawl":
+                job = data.get("job") or data
+                results_text += f"Crawl job: {json.dumps(job, ensure_ascii=True)[:500]}...\n"
+            elif "sessions" in data:
                 results_text += f"Found {data.get('count', 0)} sessions:\n"
                 for s in data.get("sessions", [])[:5]:
                     results_text += f"- {s.get('scheduled_start', 'No date')}: {s.get('type', 'Session')} with {s.get('mentor', 'Unknown')}\n"
@@ -1096,6 +1240,11 @@ def _get_entity_type_from_tool(tool_name: str) -> str:
         "search_rag": "document",
         "search_graph": "document",
         "query_graph": "entity",
+        "firecrawl_scrape": "document",
+        "firecrawl_search": "document",
+        "firecrawl_map": "document",
+        "firecrawl_extract": "document",
+        "firecrawl_crawl": "document",
     }
     return mapping.get(tool_name, "document")
 
@@ -1114,6 +1263,11 @@ def _get_group_key_from_tool(tool_name: str) -> str:
         "search_rag": "documents",
         "search_graph": "documents",
         "query_graph": "entities",
+        "firecrawl_scrape": "documents",
+        "firecrawl_search": "documents",
+        "firecrawl_map": "documents",
+        "firecrawl_extract": "documents",
+        "firecrawl_crawl": "documents",
     }
     return mapping.get(tool_name, "documents")
 
@@ -1148,6 +1302,27 @@ def _get_display_name_from_data(tool_name: str, data: dict) -> str:
         results = data.get("results", [])
         count = len(results)
         return f"Documents ({count})" if count > 1 else "Document"
+    elif tool_name == "firecrawl_scrape":
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        title = metadata.get("title") or metadata.get("og:title")
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+        url = data.get("url")
+        return url if isinstance(url, str) and url.strip() else "Scraped Page"
+    elif tool_name == "firecrawl_search":
+        count = data.get("count")
+        if not isinstance(count, int):
+            count = len(data.get("results", [])) if isinstance(data.get("results"), list) else 0
+        return f"Web Results ({count})" if count else "Web Results"
+    elif tool_name == "firecrawl_map":
+        url = data.get("url")
+        if isinstance(url, str) and url.strip():
+            return f"Site Map: {url}"
+        return "Site Map"
+    elif tool_name == "firecrawl_extract":
+        return "Extracted Data"
+    elif tool_name == "firecrawl_crawl":
+        return "Crawl Job"
     else:
         return tool_name.replace("_", " ").title()
 
@@ -1180,6 +1355,37 @@ def _get_content_summary_from_data(tool_name: str, data: dict) -> str:
         if results and isinstance(results[0], dict):
             return _extract_result_text(results[0])[:150]
         return "Document search results"
+    elif tool_name == "firecrawl_scrape":
+        summary = data.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            return summary[:150]
+        markdown = data.get("markdown")
+        if isinstance(markdown, str) and markdown.strip():
+            return markdown[:150]
+        return "Scraped web content"
+    elif tool_name == "firecrawl_search":
+        results = data.get("results", [])
+        if results and isinstance(results[0], dict):
+            first = results[0]
+            title = first.get("title") or first.get("url") or "Result"
+            description = first.get("description") or ""
+            summary = f"{title} - {description}".strip(" -")
+            return summary[:150]
+        return "Web search results"
+    elif tool_name == "firecrawl_map":
+        urls = data.get("urls") if isinstance(data.get("urls"), list) else []
+        return f"{len(urls)} URLs discovered" if urls else "Site map results"
+    elif tool_name == "firecrawl_extract":
+        results = data.get("results")
+        if isinstance(results, list) and results:
+            return json.dumps(results[0], ensure_ascii=True)[:150]
+        if isinstance(results, dict):
+            return json.dumps(results, ensure_ascii=True)[:150]
+        return "Extracted data"
+    elif tool_name == "firecrawl_crawl":
+        job = data.get("job") if isinstance(data.get("job"), dict) else {}
+        job_id = job.get("id") or job.get("jobId")
+        return f"Crawl job {job_id}" if job_id else "Crawl job info"
     else:
         return str(data)[:100]
 
@@ -1228,6 +1434,27 @@ def _extract_metadata_from_data(tool_name: str, data: dict) -> dict[str, Any]:
             metadata["resultCount"] = len(results)
             if isinstance(results[0], dict) and results[0].get("text"):
                 metadata["excerpt"] = results[0]["text"][:200]
+    elif tool_name in ("firecrawl_search", "firecrawl_map"):
+        count = data.get("count")
+        if isinstance(count, int):
+            metadata["resultCount"] = count
+        url = data.get("url")
+        if isinstance(url, str) and url.strip():
+            metadata["url"] = url
+    elif tool_name in ("firecrawl_scrape", "firecrawl_extract", "firecrawl_crawl"):
+        url = data.get("url")
+        if isinstance(url, str) and url.strip():
+            metadata["url"] = url
+        if tool_name == "firecrawl_scrape":
+            metadata["title"] = (
+                data.get("metadata", {}).get("title")
+                if isinstance(data.get("metadata"), dict)
+                else None
+            )
+        if tool_name == "firecrawl_extract":
+            results = data.get("results")
+            if isinstance(results, list):
+                metadata["resultCount"] = len(results)
 
     return {k: v for k, v in metadata.items() if v is not None}
 
@@ -1259,6 +1486,10 @@ DOCUMENT_TOOL_TITLES: dict[str, str] = {
     "search_summaries": "Document Summaries",
     "search_rag": "RAG Answer",
     "search_graph": "Graph Answer",
+    "firecrawl_search": "Web Search Results",
+    "firecrawl_scrape": "Web Page Content",
+    "firecrawl_map": "Site Map",
+    "firecrawl_extract": "Extracted Web Data",
 }
 
 DOCUMENT_TOOLS = set(DOCUMENT_TOOL_TITLES.keys())
@@ -1366,6 +1597,9 @@ def _build_document_title(tool_name: str, data: dict) -> str:
     query = data.get("query") if isinstance(data, dict) else None
     if isinstance(query, str) and query.strip():
         return _truncate_title(f"{base}: {query.strip()}")
+    url = data.get("url") if isinstance(data, dict) else None
+    if isinstance(url, str) and url.strip():
+        return _truncate_title(f"{base}: {url.strip()}")
     return base
 
 
@@ -1375,6 +1609,69 @@ def _build_document_content(tool_name: str, data: dict) -> str:
 
     query = data.get("query") if isinstance(data.get("query"), str) else ""
     results = data.get("results") if isinstance(data.get("results"), list) else []
+
+    if tool_name == "firecrawl_scrape":
+        markdown = data.get("markdown") if isinstance(data.get("markdown"), str) else ""
+        summary = data.get("summary") if isinstance(data.get("summary"), str) else ""
+        url = data.get("url") if isinstance(data.get("url"), str) else ""
+        lines: list[str] = []
+        if url:
+            lines.append(f"## URL\n{url}\n")
+        if summary:
+            lines.append("## Summary")
+            lines.append(summary)
+            lines.append("")
+        if markdown:
+            lines.append("## Content")
+            lines.append(markdown)
+        return "\n".join(lines).strip()
+
+    if tool_name == "firecrawl_map":
+        urls = data.get("urls") if isinstance(data.get("urls"), list) else []
+        if not urls:
+            return ""
+        lines = ["## URLs"]
+        lines.extend([str(url) for url in urls])
+        return "\n".join(lines).strip()
+
+    if tool_name == "firecrawl_search":
+        if not results:
+            return ""
+        lines: list[str] = []
+        if query:
+            lines.append("## Query")
+            lines.append(query)
+            lines.append("")
+        lines.append("## Results")
+        for index, item in enumerate(results, start=1):
+            if not isinstance(item, dict):
+                lines.append(f"### Result {index}")
+                lines.append(str(item))
+                lines.append("")
+                continue
+            title = item.get("title") or item.get("url") or f"Result {index}"
+            description = item.get("description") or ""
+            lines.append(f"### {title}")
+            if item.get("url"):
+                lines.append(str(item["url"]))
+            if description:
+                lines.append(description)
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    if tool_name == "firecrawl_extract":
+        extracted = data.get("results")
+        if extracted is None:
+            return ""
+        content = json.dumps(extracted, ensure_ascii=True, indent=2)
+        lines: list[str] = []
+        if query:
+            lines.append("## Query")
+            lines.append(query)
+            lines.append("")
+        lines.append("## Extracted Data")
+        lines.append(content)
+        return "\n".join(lines).strip()
 
     if tool_name in ("search_rag", "search_graph"):
         answer = data.get("answer") if isinstance(data.get("answer"), str) else ""
@@ -1541,12 +1838,7 @@ async def _emit_document_artifacts_from_sources(
         if not content:
             continue
 
-        query = data.get("query") if isinstance(data, dict) else None
-        base_title = "Graph Results"
-        if isinstance(query, str) and query.strip():
-            title = _truncate_title(f"{base_title}: {query.strip()}")
-        else:
-            title = base_title
+        title = _build_document_title(tool_name, data)
         summary = content.replace("\n", " ").strip()[:160]
         origin = {
             "tool_name": tool_name,
@@ -1749,7 +2041,11 @@ async def _generate_handoff_summary(
         [
             SystemMessage(content="You create handoff summaries for chat blocks."),
             HumanMessage(content=user_prompt),
-        ]
+        ],
+        config={
+            "tags": ["handoff_summary"],
+            "metadata": {"purpose": "handoff_summary"},
+        },
     )
     return response.content.strip()
 

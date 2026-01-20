@@ -9,10 +9,12 @@ from typing import AsyncGenerator
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
+from langgraph.errors import GraphRecursionError
 
 from app.models.chat import ChatRequest
 from app.persistence.redis import get_thread_config
 from app.streaming import LangGraphEventMapper, SSEEvent, SSEEventType, ErrorData
+from app.streaming.deep_agent_event_mapper import DeepAgentEventMapper
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -37,11 +39,18 @@ async def sse_event_generator(
     Yields:
         SSE-formatted strings for streaming response
     """
-    mapper = LangGraphEventMapper()
     thread_id = request.thread_id or request.session_id or str(uuid.uuid4())
+
+    # Select mapper based on orchestrator type
+    use_deep_agent = getattr(request, "use_deep_agent", False)
+    if use_deep_agent:
+        mapper = DeepAgentEventMapper()
+    else:
+        mapper = LangGraphEventMapper()
 
     try:
         checkpointer = req.app.state.checkpointer
+        store = getattr(req.app.state, "store", None)
 
         # Get user context
         auth0_id = None
@@ -56,12 +65,22 @@ async def sse_event_generator(
                 "cohort": request.user_context.cohort,
             }
 
-        # Use v3 orchestrator by default (supervisor pattern with parallel workers)
-        # Fall back to v2 or v1 if specified
+        # Orchestrator selection priority: deep_agent > v3 > v2 > v1
         use_v3 = getattr(request, "use_v3", True)
         use_v2 = getattr(request, "use_v2", False)
 
-        if use_v3:
+        if use_deep_agent:
+            # Deep Agent orchestrator (planning, subagents, context management)
+            from app.graphs.orchestrator_deep_agent import get_orchestrator_deep_agent
+            graph = await get_orchestrator_deep_agent(
+                checkpointer=checkpointer,
+                store=store,
+                user_context=user_context_dict,
+                auth0_id=auth0_id,
+                selected_tools=request.selected_tools,
+            )
+            logger.info("Using Deep Agent orchestrator")
+        elif use_v3:
             from app.graphs.orchestrator_v3 import get_orchestrator_v3
             graph = await get_orchestrator_v3(
                 checkpointer=checkpointer,
@@ -103,7 +122,10 @@ async def sse_event_generator(
             )
 
         # Build input state based on orchestrator version
-        if use_v3:
+        if use_deep_agent:
+            # Deep Agent uses simple message format (handles state internally)
+            input_state = {"messages": [{"role": "user", "content": message}]}
+        elif use_v3:
             # V3 uses explicit query field and structured state
             input_state = {
                 "messages": [{"role": "user", "content": message}],
@@ -113,6 +135,7 @@ async def sse_event_generator(
                 "chat_block_id": request.chat_block_id,
                 "auto_artifacts": request.auto_artifacts,
                 "context_artifacts": request.context_artifacts or [],
+                "selected_tools": request.selected_tools or [],
                 "plan": None,
                 "planned_calls": [],
                 "tool_results": [],
@@ -149,6 +172,16 @@ async def sse_event_generator(
     except asyncio.CancelledError:
         logger.info("SSE stream cancelled by client disconnect")
         raise
+
+    except GraphRecursionError as e:
+        logger.warning(f"Graph recursion limit reached: {e}")
+        error_msg = (
+            "The request required too many processing steps. "
+            "This can happen with complex queries that trigger many sub-tasks. "
+            "Try simplifying your request or breaking it into smaller questions."
+        )
+        error_event = mapper.create_error_event(error_msg)
+        yield error_event.to_sse_string()
 
     except Exception as e:
         logger.error(f"SSE streaming error: {e}", exc_info=True)

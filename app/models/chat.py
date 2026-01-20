@@ -59,6 +59,10 @@ class ChatRequest(BaseModel):
         default=None,
         description="Artifacts to include as context for this chat block",
     )
+    use_deep_agent: bool = Field(
+        default=False,
+        description="Use Deep Agent orchestrator with planning, subagents, and context management (takes precedence over v3/v2)",
+    )
     use_v3: bool = Field(
         default=True,
         description="Use v3 orchestrator with supervisor pattern (parallel workers, evaluator, retry)",
@@ -70,6 +74,10 @@ class ChatRequest(BaseModel):
     model_config_override: Optional[dict[str, str]] = Field(
         default=None,
         description="Optional model overrides (orchestrator_model, memory_model, etc.)",
+    )
+    selected_tools: Optional[list[str]] = Field(
+        default=None,
+        description="User-selected tools to prioritize (e.g., ['firecrawl'])",
     )
 
 

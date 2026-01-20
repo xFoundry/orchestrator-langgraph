@@ -7,6 +7,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
+from langgraph.errors import GraphRecursionError
 
 from app.models.chat import ChatRequest, ChatResponse, Citation, AgentActivity
 from app.persistence.redis import get_thread_config
@@ -81,6 +82,17 @@ async def chat(request: ChatRequest, req: Request) -> ChatResponse:
             agent_trace=[],
             thread_id=thread_id,
             status="success",
+        )
+
+    except GraphRecursionError as e:
+        logger.warning(f"Graph recursion limit reached: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "The request required too many processing steps. "
+                "This can happen with complex queries that trigger many sub-tasks. "
+                "Try simplifying your request or breaking it into smaller questions."
+            ),
         )
 
     except Exception as e:

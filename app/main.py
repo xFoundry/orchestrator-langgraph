@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pythonjsonlogger import jsonlogger
 
 from app.config import get_settings
-from app.persistence.redis import get_checkpointer, close_checkpointer
+from app.persistence.redis import get_checkpointer, close_checkpointer, get_store, close_store
 from app.api.routes import chat, chat_stream
 
 # Configure logging
@@ -53,11 +53,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.error(f"Failed to initialize Redis checkpointer: {e}")
         raise
 
+    # Initialize store for persistent memories
+    try:
+        store = await get_store()
+        app.state.store = store
+        logger.info(f"LangGraph store initialized at {settings.redis_url}")
+    except Exception as e:
+        logger.error(f"Failed to initialize LangGraph store: {e}")
+        raise
+
     yield
 
     # Cleanup
     logger.info("Shutting down orchestrator-langgraph service")
     await close_checkpointer()
+    await close_store()
 
 
 # Create FastAPI app

@@ -13,6 +13,7 @@ from app.streaming.sse_events import (
     ErrorData,
 )
 from app.streaming.event_mapper import LangGraphEventMapper
+from app.streaming.deep_agent_event_mapper import DeepAgentEventMapper
 
 __all__ = [
     "SSEEvent",
@@ -26,4 +27,5 @@ __all__ = [
     "CompleteData",
     "ErrorData",
     "LangGraphEventMapper",
+    "DeepAgentEventMapper",
 ]

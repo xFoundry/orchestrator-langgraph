@@ -107,6 +107,15 @@ class LangGraphEventMapper:
             if chunk and hasattr(chunk, "content") and chunk.content:
                 content = chunk.content
                 if isinstance(content, str) and content:
+                    tags = set(event.get("tags") or [])
+                    tags.update(metadata.get("tags") or [])
+                    purpose = metadata.get("purpose")
+                    if isinstance(metadata.get("metadata"), dict) and not purpose:
+                        purpose = metadata["metadata"].get("purpose")
+                    if "handoff_summary" in tags or purpose == "handoff_summary":
+                        logger.debug("Filtering handoff summary stream output")
+                        return sse_events
+
                     # Only accumulate and emit text from final response nodes
                     # Filter out internal LLM calls (planner, evaluator JSON output)
                     node_name = metadata.get("langgraph_node", "")

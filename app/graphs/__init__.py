@@ -39,6 +39,10 @@ from app.graphs.routing import (
     get_workflow_for_query_type,
     QueryType,
 )
+from app.graphs.orchestrator_deep_agent import (
+    create_orchestrator_deep_agent,
+    get_orchestrator_deep_agent,
+)
 
 __all__ = [
     # Orchestrator
@@ -75,4 +79,7 @@ __all__ = [
     "analyze_query",
     "get_workflow_for_query_type",
     "QueryType",
+    # Deep Agent Orchestrator
+    "create_orchestrator_deep_agent",
+    "get_orchestrator_deep_agent",
 ]

@@ -47,11 +47,24 @@ class Settings(BaseSettings):
     # Mentor Hub API (for live data access)
     mentor_hub_api_url: str = "http://localhost:3001/api"
 
+    # Firecrawl (self-hosted or cloud)
+    firecrawl_api_url: str = "https://api.firecrawl.dev"
+    firecrawl_api_key: Optional[str] = None
+
     # Memory (via Cognee integration)
     cognee_memory_enabled: bool = True
 
     # Redis
     redis_url: str = "redis://localhost:6379"
+
+    # Deep Agent Configuration
+    deep_agent_model: Optional[str] = None  # Defaults to default_orchestrator_model
+    deep_agent_enable_subagents: bool = True
+    deep_agent_enable_filesystem: bool = True
+    deep_agent_memory_ttl_days: int = 30  # How long to retain /memories/ files
+
+    # LangGraph Execution Limits
+    recursion_limit: int = 100  # Max graph steps (default 25 is too low for deep agents)
 
     @property
     def cors_origins_list(self) -> list[str]:
