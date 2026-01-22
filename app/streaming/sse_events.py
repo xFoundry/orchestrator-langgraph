@@ -17,6 +17,7 @@ class SSEEventType(str, Enum):
     CITATION = "citation"
     TOOL_RESULT = "tool_result"
     THINKING = "thinking"  # For planning/reasoning steps
+    TODO = "todo"  # For todo/task list updates
     ARTIFACT = "artifact"
     COMPLETE = "complete"
     ERROR = "error"
@@ -85,6 +86,22 @@ class ThinkingData(BaseModel):
     phase: str  # "planning", "reasoning", "action", "final_answer"
     content: str
     agent: str
+    timestamp: Optional[float] = None
+
+
+class TodoItemData(BaseModel):
+    """Data for a single todo item."""
+
+    id: str
+    content: str
+    status: str  # "pending", "in_progress", "completed"
+    activeForm: Optional[str] = None  # Present continuous form for display
+
+
+class TodoData(BaseModel):
+    """Data for todo events - contains the full list of todos."""
+
+    todos: list[TodoItemData]
     timestamp: Optional[float] = None
 
 

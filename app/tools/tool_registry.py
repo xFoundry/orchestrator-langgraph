@@ -203,6 +203,26 @@ def create_default_registry(user_id: Optional[str] = None) -> ToolRegistry:
         logger.warning(f"Could not import firecrawl tools: {e}")
 
     # =========================================================================
+    # OUTLINE MCP TOOLS
+    # =========================================================================
+    try:
+        from app.tools.outline_mcp_tools import get_outline_mcp_tools
+
+        outline_tools = get_outline_mcp_tools()
+        if outline_tools:
+            registry.register_group(
+                ToolGroup(
+                    name="outline_mcp",
+                    tools=outline_tools,
+                    description="Outline knowledge base tools (collections, documents, search). "
+                    "Use to find and read documents in Outline.",
+                )
+            )
+            logger.info("Registered outline_mcp tool group")
+    except ImportError as e:
+        logger.warning(f"Could not import outline MCP tools: {e}")
+
+    # =========================================================================
     # USER MEMORY TOOLS (requires user_id)
     # =========================================================================
     if user_id:

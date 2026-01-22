@@ -1,18 +1,18 @@
 """
 Clarification tools for asking structured questions in the chat UI.
 
-Emits clarification artifacts that the frontend can render as inline UI.
+Uses LangGraph's interrupt() for proper human-in-the-loop workflow.
+The frontend renders these as interactive, selectable UI components.
 """
 
 from __future__ import annotations
 
 import re
-import time
 import uuid
 from typing import Optional
 
-from langchain_core.callbacks.manager import adispatch_custom_event
 from langchain_core.tools import StructuredTool
+from langgraph.types import interrupt
 from pydantic import BaseModel, Field
 
 
@@ -21,11 +21,23 @@ def _slugify(text: str) -> str:
     return slug or "option"
 
 
+class ClarificationOption(BaseModel):
+    """A single option in a clarification question."""
+
+    label: str = Field(..., description="The display label for this option.")
+    description: Optional[str] = Field(
+        None, description="Optional description shown below the label."
+    )
+    value: Optional[str] = Field(
+        None, description="Value to return if selected. Defaults to label."
+    )
+
+
 class ClarificationQuestionInput(BaseModel):
     """Single clarification question."""
 
     prompt: str = Field(..., description="Question text to present to the user.")
-    options: list[str] = Field(
+    options: list[str | ClarificationOption] = Field(
         ...,
         description="Multiple choice options for the user to pick from.",
         min_length=1,
@@ -66,22 +78,38 @@ class ClarificationRequestInput(BaseModel):
     )
 
 
-async def request_clarifications_impl(
+def request_clarifications_impl(
     title: Optional[str],
     description: Optional[str],
     questions: list[ClarificationQuestionInput],
 ) -> str:
-    """Emit a clarification UI payload for the frontend to render."""
+    """
+    Request clarifications from the user using LangGraph interrupt.
+    
+    This pauses the agent execution and waits for user input.
+    The frontend renders interactive selection UI.
+    """
     request_id = f"clarification_{uuid.uuid4().hex[:8]}"
     normalized_questions: list[dict[str, object]] = []
 
     for index, question in enumerate(questions):
-        question_id = question.question_id or f"question_{index + 1}_{uuid.uuid4().hex[:4]}"
+        question_id = (
+            question.question_id or f"question_{index + 1}_{uuid.uuid4().hex[:4]}"
+        )
         option_ids: set[str] = set()
-        options_payload: list[dict[str, str]] = []
+        options_payload: list[dict[str, str | None]] = []
 
         for opt_index, option in enumerate(question.options):
-            label = option.strip()
+            # Handle both string options and ClarificationOption objects
+            if isinstance(option, str):
+                label = option.strip()
+                option_description = None
+                value = label
+            else:
+                label = option.label.strip()
+                option_description = option.description
+                value = option.value or label
+
             if not label:
                 continue
 
@@ -91,46 +119,67 @@ async def request_clarifications_impl(
                 option_id = f"{base_id}_{opt_index + 1}"
             option_ids.add(option_id)
 
-            options_payload.append({"id": option_id, "label": label})
+            options_payload.append({
+                "id": option_id,
+                "label": label,
+                "description": option_description,
+                "value": value,
+            })
 
         if not options_payload:
             continue
 
-        normalized_questions.append(
-            {
-                "id": question_id,
-                "prompt": question.prompt,
-                "selectionType": "multi" if question.multi_select else "single",
-                "allowOther": question.allow_other,
-                "required": question.required,
-                "options": options_payload,
-            }
-        )
-
-    payload = {
-        "id": request_id,
-        "title": title or "Clarifying questions",
-        "description": description,
-        "questions": normalized_questions,
-    }
+        normalized_questions.append({
+            "id": question_id,
+            "prompt": question.prompt,
+            "selectionType": "multi" if question.multi_select else "single",
+            "allowOther": question.allow_other,
+            "required": question.required,
+            "options": options_payload,
+        })
 
     if not normalized_questions:
         return "No valid clarification questions were provided."
 
-    await adispatch_custom_event(
-        "artifact",
-        {
-            "type": "artifact",
-            "id": request_id,
-            "artifact_type": "clarification",
-            "title": payload["title"],
-            "summary": description,
-            "payload": payload,
-            "created_at": time.time(),
-        },
-    )
+    # Build the interrupt payload for the frontend
+    interrupt_payload = {
+        "type": "clarification",
+        "id": request_id,
+        "title": title or "Asking for clarification",
+        "description": description,
+        "questions": normalized_questions,
+        "total_questions": len(normalized_questions),
+        "current_question": 1,
+    }
 
-    return "Clarification questions requested from the user. Wait for their response."
+    # Build a lookup from question ID to question prompt
+    question_prompts = {q["id"]: q["prompt"] for q in normalized_questions}
+
+    # Use LangGraph interrupt to pause execution and wait for user response
+    # The frontend will render this as an interactive UI
+    user_response = interrupt(interrupt_payload)
+
+    # Format the user's response for the agent with readable question prompts
+    if isinstance(user_response, dict):
+        answers = []
+        for q_id, answer in user_response.items():
+            # Get the original question prompt for readability
+            question_text = question_prompts.get(q_id, q_id)
+            # Truncate long questions for cleaner output
+            if len(question_text) > 60:
+                question_text = question_text[:57] + "..."
+            
+            if isinstance(answer, list):
+                answer_text = ", ".join(str(a) for a in answer)
+            else:
+                answer_text = str(answer)
+            
+            answers.append(f"{question_text}: {answer_text}")
+        return f"User responded with: {'; '.join(answers)}"
+    elif isinstance(user_response, str):
+        return f"User responded with: {user_response}"
+    else:
+        return f"User responded with: {user_response}"
 
 
 def get_clarification_tools() -> list[StructuredTool]:
@@ -140,10 +189,11 @@ def get_clarification_tools() -> list[StructuredTool]:
         description=(
             "Ask the user clarifying questions with multiple-choice options. "
             "Use when key details are missing or ambiguous. "
-            "Provide 1-3 questions and include options; avoid open-ended prompts."
+            "Provide 1-3 questions with helpful options. "
+            "Each option can have a label and optional description. "
+            "Include an 'Other' option when appropriate."
         ),
-        func=lambda *args, **kwargs: None,
-        coroutine=request_clarifications_impl,
+        func=request_clarifications_impl,
         args_schema=ClarificationRequestInput,
     )
 

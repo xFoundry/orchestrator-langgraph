@@ -1,6 +1,10 @@
 #!/usr/bin/env sh
 set -e
 
+if [ -f "./scripts/ensure-env.sh" ]; then
+  . "./scripts/ensure-env.sh"
+fi
+
 MODE="${USE_LANGGRAPH_SERVER:-false}"
 
 if [ "$MODE" = "true" ] || [ "$MODE" = "1" ]; then
@@ -14,4 +18,7 @@ if [ "$MODE" = "true" ] || [ "$MODE" = "1" ]; then
 fi
 
 echo "Starting FastAPI orchestrator..."
-exec python -m uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}"
+if command -v python >/dev/null 2>&1; then
+  exec python -m uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}"
+fi
+exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}"

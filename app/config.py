@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # LLM Providers
     openai_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
+    openrouter_api_key: Optional[str] = None  # For routing Anthropic models via OpenRouter
+    
+    # OpenRouter Settings
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    use_openrouter_for_anthropic: bool = True  # Route Anthropic models through OpenRouter
 
     # Default Models
     default_orchestrator_model: str = "gpt-5.2"
@@ -51,20 +56,32 @@ class Settings(BaseSettings):
     firecrawl_api_url: str = "https://api.firecrawl.dev"
     firecrawl_api_key: Optional[str] = None
 
+    # Outline MCP (server-to-server)
+    outline_mcp_base_url: str = "https://docs.xfoundry.org"
+    outline_mcp_api_key: Optional[str] = None
+    outline_mcp_protocol_version: str = "2025-06-18"
+    outline_mcp_timeout_seconds: float = 30.0
+
     # Memory (via Cognee integration)
     cognee_memory_enabled: bool = True
 
     # Redis
     redis_url: str = "redis://localhost:6379"
+    # Postgres (LangGraph Store)
+    postgres_url: Optional[str] = None
 
     # Deep Agent Configuration
     deep_agent_model: Optional[str] = None  # Defaults to default_orchestrator_model
     deep_agent_enable_subagents: bool = True
     deep_agent_enable_filesystem: bool = True
+    deep_agent_enable_hitl: bool = False
     deep_agent_memory_ttl_days: int = 30  # How long to retain /memories/ files
+    deep_agent_enable_thinking: bool = True  # Enable extended thinking for supported models
+    deep_agent_reasoning_effort: str = "high"  # For GPT-5.2: "none", "low", "medium", "high", "xhigh"
+    deep_agent_thinking_budget: int = 10000  # Token budget for Claude thinking
 
     # LangGraph Execution Limits
-    recursion_limit: int = 100  # Max graph steps (default 25 is too low for deep agents)
+    recursion_limit: int = 300  # Max graph steps (default 25 is too low for deep agents)
 
     @property
     def cors_origins_list(self) -> list[str]:

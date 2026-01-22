@@ -137,20 +137,50 @@ In the Railway dashboard:
 Set these in Railway dashboard or via CLI:
 
 ```bash
-# Required
+# Required - LLM API Keys
 railway variables set OPENAI_API_KEY=sk-...
+
+# OpenRouter - Recommended for Anthropic models (single API key for all providers)
+# Get your key at: https://openrouter.ai/keys
+railway variables set OPENROUTER_API_KEY=sk-or-v1-...
+
+# OR use direct Anthropic API (not needed if using OpenRouter)
+# railway variables set ANTHROPIC_API_KEY=sk-ant-...
+
+# External Services
 railway variables set COGNEE_API_URL=https://your-cognee-service.railway.app
 railway variables set COGNEE_SECRET_KEY=your-secret
 railway variables set CORS_ORIGINS=https://your-frontend.vercel.app
 
+# Outline MCP (docs knowledge base)
+railway variables set OUTLINE_MCP_BASE_URL=https://docs.xfoundry.org
+railway variables set OUTLINE_MCP_API_KEY=your-outline-api-key
+railway variables set OUTLINE_MCP_PROTOCOL_VERSION=2025-06-18
+
 # Redis is automatically linked via ${{Redis.REDIS_URL}}
 
-# Optional
-railway variables set ANTHROPIC_API_KEY=sk-ant-...
-railway variables set DEFAULT_ORCHESTRATOR_MODEL=gpt-4o
-railway variables set DEFAULT_RESEARCH_MODEL=gpt-4o-mini
+# Optional - Model Configuration
+railway variables set DEFAULT_ORCHESTRATOR_MODEL=gpt-5.2
+railway variables set DEFAULT_RESEARCH_MODEL=gpt-5.2-pro
 railway variables set LOG_LEVEL=INFO
+
+# Optional - OpenRouter Settings
+# railway variables set USE_OPENROUTER_FOR_ANTHROPIC=true  # Default: true
+# railway variables set OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 ```
+
+#### Model Provider Setup
+
+The orchestrator supports two ways to access Anthropic models:
+
+1. **OpenRouter (Recommended)**: Single API key for multiple providers
+   - Set `OPENROUTER_API_KEY` 
+   - Anthropic models are automatically routed through OpenRouter
+   - Benefits: Unified billing, fallbacks, access to many providers
+
+2. **Direct Anthropic API**: Use your Anthropic API key directly
+   - Set `ANTHROPIC_API_KEY`
+   - Set `USE_OPENROUTER_FOR_ANTHROPIC=false`
 
 ### 4. Deploy
 
@@ -166,6 +196,37 @@ Add the Railway URL to your frontend environment:
 
 ```env
 ORCHESTRATOR_LANGGRAPH_URL=https://orchestrator-langgraph-production.up.railway.app
+```
+
+## Outline MCP Smoke Test
+
+1) Initialize a session:
+
+```bash
+curl -s -X POST "$OUTLINE_MCP_BASE_URL/api/mcp" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OUTLINE_MCP_API_KEY" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+      "protocolVersion": "2025-06-18",
+      "capabilities": {},
+      "clientInfo": { "name": "mcp-smoke-test", "version": "1.0.0" }
+    }
+  }' -i
+```
+
+2) Copy `Mcp-Session-Id` + `MCP-Protocol-Version` headers and list tools:
+
+```bash
+curl -s -X POST "$OUTLINE_MCP_BASE_URL/api/mcp" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OUTLINE_MCP_API_KEY" \
+  -H "MCP-Protocol-Version: 2025-06-18" \
+  -H "Mcp-Session-Id: <session-id>" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 ```
 
 ## Project Structure

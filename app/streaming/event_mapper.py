@@ -105,8 +105,22 @@ class LangGraphEventMapper:
             # Token streaming from LLM
             chunk = event.get("data", {}).get("chunk")
             if chunk and hasattr(chunk, "content") and chunk.content:
-                content = chunk.content
-                if isinstance(content, str) and content:
+                raw_content = chunk.content
+
+                # Handle content as either string or list of content blocks
+                # GPT-5.x and deepagents return list format: [{'type': 'text', 'text': '...', 'index': 0}]
+                content = ""
+                if isinstance(raw_content, str):
+                    content = raw_content
+                elif isinstance(raw_content, list):
+                    # Extract text from content blocks
+                    for block in raw_content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text", "")
+                            if text:
+                                content += text
+
+                if content:
                     tags = set(event.get("tags") or [])
                     tags.update(metadata.get("tags") or [])
                     purpose = metadata.get("purpose")

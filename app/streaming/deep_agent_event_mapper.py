@@ -21,6 +21,8 @@ from app.streaming.sse_events import (
     AgentActivityData,
     ArtifactData,
     ThinkingData,
+    TodoData,
+    TodoItemData,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,17 +145,24 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                         ),
                     )
                 )
-                # Emit structured todo list for UI progress panels
+
+                # Emit dedicated TODO event for UI progress panels
+                # Convert raw todo dicts to TodoItemData objects
+                todo_items = [
+                    TodoItemData(
+                        id=todo.get("id", f"todo-{i}"),
+                        content=todo.get("content", ""),
+                        status=todo.get("status", "pending"),
+                        activeForm=todo.get("activeForm"),
+                    )
+                    for i, todo in enumerate(todos)
+                ]
                 sse_events.append(
                     SSEEvent(
-                        event=SSEEventType.ARTIFACT,
-                        data=ArtifactData(
-                            id=f"todo_list_{uuid.uuid4().hex[:8]}",
-                            artifact_type="todo_list",
-                            title="Task plan",
-                            summary="Current task breakdown from the agent",
-                            payload={"todos": todos},
-                            created_at=timestamp,
+                        event=SSEEventType.TODO,
+                        data=TodoData(
+                            todos=todo_items,
+                            timestamp=timestamp,
                         ),
                     )
                 )
@@ -199,55 +208,13 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                         logger.debug(f"Filtering internal filesystem op: {tool_name} {path}")
                         return sse_events
 
-                # Handle artifact writes - emit artifact events for /artifacts/
+                # Artifact writes to /artifacts/ are handled in on_tool_end
+                # (content is already captured at lines 97-110 above)
                 if path.startswith("/artifacts/") and tool_name in ("write_file", "edit_file"):
-                    content = tool_input.get("content", "")
-                    filename = path.split("/")[-1]
-                    is_saved = "/artifacts/saved/" in path
-                    action = "create" if tool_name == "write_file" else "update"
-
-                    # Generate artifact event
-                    sse_events.append(
-                        SSEEvent(
-                            event=SSEEventType.ARTIFACT,
-                            data=ArtifactData(
-                                id=path,  # Use path as ID for updates
-                                artifact_type="document",
-                                title=filename,
-                                summary=content[:200] if content else None,
-                                payload={
-                                    "path": path,
-                                    "content": content,
-                                    "action": action,
-                                    "saved": is_saved,
-                                },
-                                created_at=timestamp,
-                            ),
-                        )
-                    )
-
-                    # Also emit activity for trace
-                    action_desc = "Created" if tool_name == "write_file" else "Updated"
-                    if is_saved:
-                        action_desc = f"Saved permanently: {filename}"
-                    else:
-                        action_desc = f"{action_desc}: {filename}"
-
-                    sse_events.append(
-                        SSEEvent(
-                            event=SSEEventType.AGENT_ACTIVITY,
-                            data=AgentActivityData(
-                                agent=self._current_agent,
-                                action="artifact",
-                                tool_name=tool_name,
-                                details=action_desc,
-                                timestamp=timestamp,
-                            ),
-                        )
-                    )
+                    logger.debug(f"Artifact write started: {path}")
                     return sse_events
 
-                # Show user-relevant filesystem operations
+                # Build action description based on tool and path
                 if path.startswith("/memories/"):
                     action_desc = {
                         "read_file": "Reading memory",
@@ -255,23 +222,32 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                         "ls": "Listing memories",
                         "edit_file": "Updating memory",
                     }.get(tool_name, tool_name)
+                    action_type = "memory"
+                else:
+                    # General file operations
+                    action_desc = {
+                        "read_file": "Reading file",
+                        "write_file": "Writing file",
+                        "edit_file": "Editing file",
+                        "ls": "Listing directory",
+                        "glob": "Searching files",
+                        "grep": "Searching content",
+                    }.get(tool_name, tool_name)
+                    action_type = "file"
 
-                    sse_events.append(
-                        SSEEvent(
-                            event=SSEEventType.AGENT_ACTIVITY,
-                            data=AgentActivityData(
-                                agent=self._current_agent,
-                                action="memory",
-                                tool_name=tool_name,
-                                details=f"{action_desc}: {path}",
-                                timestamp=timestamp,
-                            ),
-                        )
+                # Emit activity event for all visible file operations
+                sse_events.append(
+                    SSEEvent(
+                        event=SSEEventType.AGENT_ACTIVITY,
+                        data=AgentActivityData(
+                            agent=self._current_agent,
+                            action=action_type,
+                            tool_name=tool_name,
+                            details=f"{action_desc}: {path}" if path else action_desc,
+                            timestamp=timestamp,
+                        ),
                     )
-                    return sse_events
-
-                # For other filesystem ops, just log but don't emit
-                logger.debug(f"Filesystem op: {tool_name} {path}")
+                )
                 return sse_events
 
             # -----------------------------------------------------------------
@@ -306,7 +282,10 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                     path = entry["path"]
                     title = path.split("/")[-1] or "Artifact file"
                     content = entry.get("content", "")
+                    is_saved = "/artifacts/saved/" in path
+                    action = "create" if tool_name == "write_file" else "update"
 
+                    # Emit artifact event
                     sse_events.append(
                         SSEEvent(
                             event=SSEEventType.ARTIFACT,
@@ -315,8 +294,28 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                                 artifact_type="file",
                                 title=title,
                                 summary=path,
-                                payload={"path": path, "content": content},  # Full content, no truncation
+                                payload={"path": path, "content": content, "action": action, "saved": is_saved},
                                 created_at=timestamp,
+                            ),
+                        )
+                    )
+
+                    # Emit activity for trace
+                    action_desc = "Created" if tool_name == "write_file" else "Updated"
+                    if is_saved:
+                        action_desc = f"Saved permanently: {title}"
+                    else:
+                        action_desc = f"{action_desc}: {title}"
+
+                    sse_events.append(
+                        SSEEvent(
+                            event=SSEEventType.AGENT_ACTIVITY,
+                            data=AgentActivityData(
+                                agent=self._current_agent,
+                                action="artifact",
+                                tool_name=tool_name,
+                                details=action_desc,
+                                timestamp=timestamp,
                             ),
                         )
                     )

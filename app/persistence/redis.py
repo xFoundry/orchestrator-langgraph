@@ -95,10 +95,24 @@ async def get_store() -> BaseStore:
     settings = get_settings()
 
     use_memory = os.getenv("USE_MEMORY_STORE", "false").lower() == "true"
+    postgres_url = os.getenv("POSTGRES_URL") or settings.postgres_url
     if use_memory or settings.redis_url == "memory://":
         logger.info("Using in-memory store (memories won't persist across restarts)")
         _store = InMemoryStore()
         return _store
+
+    if postgres_url:
+        try:
+            from langgraph.store.postgres import AsyncPostgresStore
+
+            logger.info("Initializing Postgres store")
+            _store_cm = AsyncPostgresStore.from_conn_string(postgres_url)
+            _store = await _store_cm.__aenter__()
+            await _store.setup()
+            logger.info("Postgres store initialized successfully")
+            return _store
+        except Exception as e:
+            logger.warning(f"Postgres store not available ({e}), falling back to Redis store")
 
     try:
         try:

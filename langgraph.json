@@ -4,7 +4,8 @@
     "."
   ],
   "graphs": {
-    "orchestrator_v3": "./app/graphs/langgraph_entry.py:make_graph"
+    "orchestrator_v3": "./app/graphs/langgraph_entry.py:make_graph",
+    "deep_agent_ui": "./app/graphs/orchestrator_deep_agent_ui.py:make_graph"
   },
   "env": ".env"
 }

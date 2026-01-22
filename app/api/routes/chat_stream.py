@@ -5,19 +5,99 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Any, Union
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from langgraph.errors import GraphRecursionError
 
-from app.models.chat import ChatRequest
+from app.models.chat import (
+    ChatRequest,
+    ContentBlock,
+    TextContentBlock,
+    ImageContentBlock,
+    FileContentBlock,
+)
 from app.persistence.redis import get_thread_config
 from app.streaming import LangGraphEventMapper, SSEEvent, SSEEventType, ErrorData
 from app.streaming.deep_agent_event_mapper import DeepAgentEventMapper
+from app.api.routes.threads import update_thread_activity
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+
+def build_message_content(request: ChatRequest) -> Union[str, list[dict[str, Any]]]:
+    """
+    Build message content from ChatRequest, supporting both legacy text and multimodal.
+    
+    Returns:
+        - str: If only text content (legacy or single text block)
+        - list[dict]: If multimodal content (images, files, mixed)
+    
+    Output format follows LangChain standard content blocks:
+    - Text: {"type": "text", "text": "..."}
+    - Image (base64): {"type": "image", "base64": "...", "mime_type": "image/jpeg"}
+    - Image (URL): {"type": "image", "url": "..."}
+    - File (base64): {"type": "file", "base64": "...", "mime_type": "application/pdf"}
+    - File (URL): {"type": "file", "url": "..."}
+    """
+    # If multimodal content is provided, use it (takes precedence)
+    if request.content:
+        content_blocks: list[dict[str, Any]] = []
+        
+        for block in request.content:
+            if isinstance(block, dict):
+                # Already a dict, pass through (handle raw dicts from frontend)
+                content_blocks.append(block)
+            elif isinstance(block, TextContentBlock):
+                content_blocks.append({"type": "text", "text": block.text})
+            elif isinstance(block, ImageContentBlock):
+                img_block: dict[str, Any] = {"type": "image"}
+                if block.base64:
+                    img_block["base64"] = block.base64
+                    if block.mime_type:
+                        img_block["mime_type"] = block.mime_type
+                elif block.url:
+                    img_block["url"] = block.url
+                if block.metadata:
+                    img_block["metadata"] = block.metadata
+                content_blocks.append(img_block)
+            elif isinstance(block, FileContentBlock):
+                file_block: dict[str, Any] = {"type": "file"}
+                if block.base64:
+                    file_block["base64"] = block.base64
+                    if block.mime_type:
+                        file_block["mime_type"] = block.mime_type
+                elif block.url:
+                    file_block["url"] = block.url
+                elif block.file_id:
+                    file_block["file_id"] = block.file_id
+                if block.metadata:
+                    file_block["metadata"] = block.metadata
+                content_blocks.append(file_block)
+        
+        # Optimization: if only a single text block, return as string
+        if len(content_blocks) == 1 and content_blocks[0].get("type") == "text":
+            return content_blocks[0]["text"]
+        
+        return content_blocks
+    
+    # Fallback to legacy message field
+    return request.message or ""
+
+
+def extract_text_from_content(content: Union[str, list[dict[str, Any]]]) -> str:
+    """Extract text content for query field (v3 orchestrator compatibility)."""
+    if isinstance(content, str):
+        return content
+    
+    text_parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text_parts.append(block.get("text", ""))
+    
+    return " ".join(text_parts)
 
 
 async def sse_event_generator(
@@ -72,14 +152,21 @@ async def sse_event_generator(
         if use_deep_agent:
             # Deep Agent orchestrator (planning, subagents, context management)
             from app.graphs.orchestrator_deep_agent import get_orchestrator_deep_agent
+
+            # Get model override from request
+            model_override = request.model_override
+            if model_override:
+                logger.info(f"Using model override from request: {model_override}")
+
             graph = await get_orchestrator_deep_agent(
                 checkpointer=checkpointer,
                 store=store,
                 user_context=user_context_dict,
                 auth0_id=auth0_id,
                 selected_tools=request.selected_tools,
+                model_override=model_override,
             )
-            logger.info("Using Deep Agent orchestrator")
+            logger.info(f"Using Deep Agent orchestrator (model: {model_override or 'default'})")
         elif use_v3:
             from app.graphs.orchestrator_v3 import get_orchestrator_v3
             graph = await get_orchestrator_v3(
@@ -112,24 +199,50 @@ async def sse_event_generator(
             tenant_id=request.tenant_id,
         )
 
-        # Build message with memory instruction if needed
-        message = request.message
+        # Build message content (supports multimodal: images, PDFs, text)
+        message_content = build_message_content(request)
+
+        # Extract text for query field and memory instructions
+        text_content = extract_text_from_content(message_content)
+
+        # Track thread metadata for thread history
+        await update_thread_activity(
+            thread_id=thread_id,
+            user_id=request.user_id or "anonymous",
+            tenant_id=request.tenant_id,
+            message_text=text_content,
+        )
+
+        # Add memory instruction if needed (prepend to text content)
         if request.use_memory and auth0_id:
-            message = (
+            memory_instruction = (
                 "[MEMORY ENABLED: Before responding, you MUST call recall() to retrieve "
                 "any relevant memories or facts stored about this user.]\n\n"
-                f"{message}"
             )
+            if isinstance(message_content, str):
+                message_content = memory_instruction + message_content
+            else:
+                # For multimodal: prepend instruction as text block
+                message_content = [
+                    {"type": "text", "text": memory_instruction + text_content}
+                ] + [b for b in message_content if b.get("type") != "text"]
+                # Update text_content for query field
+                text_content = memory_instruction + text_content
+        
+        # Log multimodal content info
+        if isinstance(message_content, list):
+            block_types = [b.get("type", "unknown") for b in message_content]
+            logger.info(f"Multimodal message with blocks: {block_types}")
 
         # Build input state based on orchestrator version
         if use_deep_agent:
             # Deep Agent uses simple message format (handles state internally)
-            input_state = {"messages": [{"role": "user", "content": message}]}
+            input_state = {"messages": [{"role": "user", "content": message_content}]}
         elif use_v3:
             # V3 uses explicit query field and structured state
             input_state = {
-                "messages": [{"role": "user", "content": message}],
-                "query": message,
+                "messages": [{"role": "user", "content": message_content}],
+                "query": text_content,  # Query is text-only for routing/planning
                 "user_context": user_context_dict,
                 "canvas_id": request.canvas_id,
                 "chat_block_id": request.chat_block_id,
@@ -148,7 +261,7 @@ async def sse_event_generator(
             }
         else:
             # V1/V2 use simple message format
-            input_state = {"messages": [{"role": "user", "content": message}]}
+            input_state = {"messages": [{"role": "user", "content": message_content}]}
 
         # Stream events from orchestrator
         async for event in graph.astream_events(
@@ -198,6 +311,19 @@ async def chat_stream(request: ChatRequest, req: Request) -> StreamingResponse:
     your request. Events are streamed as they occur, including agent activity,
     tool calls, partial response text, and citations.
 
+    ## Multimodal Support
+
+    This endpoint supports multimodal input (images and PDFs) via content blocks.
+    
+    **Supported formats:**
+    - Images: JPEG, PNG, GIF, WEBP (via base64 or URL)
+    - Documents: PDF (via base64 or URL)
+    
+    **Model compatibility:**
+    - GPT-5.2+: Images ✅, PDFs ❌ (needs preprocessing)
+    - Claude 4.5+: Images ✅, PDFs ✅
+    - Gemini: Images ✅, PDFs ✅
+
     ## Event Types
 
     - `agent_activity`: Agent actions (tool calls, delegations, thinking)
@@ -208,7 +334,7 @@ async def chat_stream(request: ChatRequest, req: Request) -> StreamingResponse:
     - `complete`: Final response with full message and metadata
     - `error`: Error information if something goes wrong
 
-    ## Example Usage
+    ## Example Usage (Text Only - Legacy)
 
     ```javascript
     const response = await fetch('/chat/stream', {
@@ -216,18 +342,21 @@ async def chat_stream(request: ChatRequest, req: Request) -> StreamingResponse:
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: 'What feedback did mentors give?' })
     });
+    ```
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
+    ## Example Usage (Multimodal)
 
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const text = decoder.decode(value);
-        // Parse SSE events from text
-        // Each event has format: "event: <type>\\ndata: <json>\\n\\n"
-    }
+    ```javascript
+    const response = await fetch('/chat/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            content: [
+                { type: 'text', text: 'What is in this image?' },
+                { type: 'image', data: 'base64...', mimeType: 'image/jpeg' }
+            ]
+        })
+    });
     ```
     """
     return StreamingResponse(
@@ -249,5 +378,16 @@ async def stream_health() -> dict:
     return {
         "status": "healthy",
         "service": "orchestrator-chat-stream",
-        "features": ["sse", "agent_activity", "text_chunks", "citations", "thinking"],
+        "features": [
+            "sse",
+            "agent_activity", 
+            "text_chunks", 
+            "citations", 
+            "thinking",
+            "multimodal",
+        ],
+        "multimodal": {
+            "supported_types": ["image/jpeg", "image/png", "image/gif", "image/webp", "application/pdf"],
+            "input_formats": ["base64", "url"],
+        },
     }

@@ -12,7 +12,7 @@ from pythonjsonlogger import jsonlogger
 
 from app.config import get_settings
 from app.persistence.redis import get_checkpointer, close_checkpointer, get_store, close_store
-from app.api.routes import chat, chat_stream
+from app.api.routes import chat, chat_stream, files, threads
 
 # Configure logging
 settings = get_settings()
@@ -90,6 +90,8 @@ app.add_middleware(
 # Include routers
 app.include_router(chat.router)
 app.include_router(chat_stream.router)
+app.include_router(files.router)
+app.include_router(threads.router)
 
 
 @app.get("/")

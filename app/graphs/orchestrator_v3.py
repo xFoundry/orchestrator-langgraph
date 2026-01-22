@@ -108,6 +108,84 @@ class OrchestratorV3State(TypedDict):
     citations: list[dict[str, Any]]
 
 
+async def _emit_ui_message(name: str, props: dict[str, Any]) -> None:
+    await adispatch_custom_event(
+        "ui",
+        {
+            "type": "ui",
+            "id": f"ui_{uuid.uuid4().hex[:8]}",
+            "name": name,
+            "props": props,
+        },
+    )
+
+
+def _extract_text_from_content(content: Any) -> Optional[str]:
+    if isinstance(content, str):
+        stripped = content.strip()
+        return stripped or None
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        combined = " ".join(part.strip() for part in parts if part.strip())
+        return combined or None
+    return None
+
+
+def _extract_query_from_messages(messages: list[AnyMessage]) -> Optional[str]:
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            extracted = _extract_text_from_content(message.content)
+            if extracted:
+                return extracted
+        if isinstance(message, dict):
+            if message.get("type") in {"human", "user"}:
+                extracted = _extract_text_from_content(message.get("content"))
+                if extracted:
+                    return extracted
+    return None
+
+
+async def normalize_input(state: OrchestratorV3State) -> dict[str, Any]:
+    """Normalize incoming state for LangGraph API clients (e.g., agent-chat-ui)."""
+    messages = state.get("messages") or []
+    query = state.get("query")
+    updates: dict[str, Any] = {}
+
+    latest_query = _extract_query_from_messages(messages) or ""
+    if latest_query and latest_query != query:
+        updates["query"] = latest_query
+        query = latest_query
+
+    if not messages and query:
+        updates["messages"] = [HumanMessage(content=query)]
+
+    if state.get("context_artifacts") is None:
+        updates["context_artifacts"] = []
+    if state.get("selected_tools") is None:
+        updates["selected_tools"] = []
+    if state.get("tool_results") is None:
+        updates["tool_results"] = []
+    if state.get("retry_count") is None:
+        updates["retry_count"] = 0
+    if state.get("max_retries") is None:
+        updates["max_retries"] = 2
+    if state.get("confidence") is None:
+        updates["confidence"] = 0.0
+    if state.get("citations") is None:
+        updates["citations"] = []
+    if state.get("evaluation") is None:
+        updates["evaluation"] = None
+    if state.get("final_answer") is None:
+        updates["final_answer"] = None
+
+    return updates
+
+
 class WorkerState(TypedDict):
     """State passed to individual tool workers."""
     tool_call: ToolCall
@@ -457,6 +535,14 @@ Now output your plan as JSON (no markdown code blocks):"""
                     "agent": "Planner",
                 },
             )
+            await _emit_ui_message(
+                "thinking",
+                {
+                    "phase": "planner",
+                    "content": reasoning,
+                    "agent": "Planner",
+                },
+            )
 
         # Convert to ToolCall format
         planned_calls = []
@@ -470,6 +556,15 @@ Now output your plan as JSON (no markdown code blocks):"""
             ))
 
         planned_calls = _ensure_selected_tools(planned_calls, selected_tools, query)
+
+        if planned_calls:
+            await _emit_ui_message(
+                "plan",
+                {
+                    "reasoning": reasoning,
+                    "tool_calls": planned_calls,
+                },
+            )
 
         logger.info(f"Planner created {len(planned_calls)} tool calls for query: {query[:50]}...")
 
@@ -549,6 +644,14 @@ async def tool_worker(state: WorkerState) -> dict[str, Any]:
 
     logger.info(f"Worker executing {tool_name} with args: {tool_args}")
 
+    await _emit_ui_message(
+        "tool_call",
+        {
+            "tool_name": tool_name,
+            "tool_args": tool_args,
+        },
+    )
+
     try:
         # Get the tool function
         tool_fn = get_tool_by_name(tool_name)
@@ -582,6 +685,15 @@ async def tool_worker(state: WorkerState) -> dict[str, Any]:
 
         logger.info(f"Worker completed {tool_name} in {execution_time}ms (success={not is_empty})")
 
+        await _emit_ui_message(
+            "tool_result",
+            {
+                "tool_name": tool_name,
+                "success": not is_empty,
+                "summary": _summarize_tool_result(tool_name, result_data),
+            },
+        )
+
         return {"tool_results": [result]}
 
     except Exception as e:
@@ -595,6 +707,15 @@ async def tool_worker(state: WorkerState) -> dict[str, Any]:
             data=None,
             error=str(e),
             execution_time_ms=execution_time,
+        )
+
+        await _emit_ui_message(
+            "tool_result",
+            {
+                "tool_name": tool_name,
+                "success": False,
+                "summary": str(e),
+            },
         )
 
         return {"tool_results": [result]}
@@ -2110,14 +2231,16 @@ def create_orchestrator_v3(
     builder = StateGraph(OrchestratorV3State)
 
     # Add nodes
+    builder.add_node("normalize_input", normalize_input)
     builder.add_node("planner", planner_node)
     builder.add_node("tool_worker", tool_worker)
     builder.add_node("evaluator", evaluator_node)
     builder.add_node("increment_retry", increment_retry)
     builder.add_node("synthesizer", synthesizer_node)
 
-    # Entry: Start with planner
-    builder.add_edge(START, "planner")
+    # Entry: Normalize input, then plan
+    builder.add_edge(START, "normalize_input")
+    builder.add_edge("normalize_input", "planner")
 
     # Planner → Spawn parallel workers OR go to synthesizer for conversational queries
     builder.add_conditional_edges(

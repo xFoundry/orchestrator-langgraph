@@ -20,14 +20,102 @@ import logging
 from typing import Any, Optional
 
 from langchain.chat_models import init_chat_model
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
 
-from app.config import get_settings
+from app.config import get_settings, Settings
 from app.tools.tool_registry import create_default_registry
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def _create_anthropic_model(
+    settings: Settings,
+    model_name: str,
+    model_kwargs: dict[str, Any],
+    log: logging.Logger,
+):
+    """Create an Anthropic model, routing through OpenRouter if configured.
+    
+    OpenRouter provides access to Anthropic models via an OpenAI-compatible API.
+    This allows using a single OpenRouter API key instead of a direct Anthropic key.
+    
+    OpenRouter supports reasoning tokens for Anthropic models via the `reasoning` parameter
+    in extra_body, which is different from Anthropic's native `thinking` parameter.
+    
+    Args:
+        settings: Application settings
+        model_name: The Anthropic model name (e.g., "claude-sonnet-4.5")
+        model_kwargs: Additional kwargs to pass to the model
+        log: Logger instance
+    
+    Returns:
+        Configured chat model instance
+    """
+    # Check if we should use OpenRouter for Anthropic models
+    if settings.use_openrouter_for_anthropic and settings.openrouter_api_key:
+        # OpenRouter uses OpenAI-compatible API with model names like "anthropic/claude-..."
+        openrouter_model_name = f"anthropic/{model_name}"
+        
+        log.info(f"Routing Anthropic model through OpenRouter: {openrouter_model_name}")
+        
+        # Filter out Anthropic-specific kwargs that need special handling for OpenRouter
+        anthropic_only_params = {"thinking", "anthropic_metadata", "anthropic_headers"}
+        openrouter_kwargs = {k: v for k, v in model_kwargs.items() if k not in anthropic_only_params}
+        
+        # Convert Anthropic's "thinking" parameter to OpenRouter's "reasoning" via extra_body
+        # OpenRouter supports reasoning tokens for Anthropic models with max_tokens or effort
+        extra_body = {}
+        if "thinking" in model_kwargs and settings.deep_agent_enable_thinking:
+            thinking_config = model_kwargs["thinking"]
+            # OpenRouter uses reasoning.max_tokens for Anthropic models (min 1024)
+            budget_tokens = thinking_config.get("budget_tokens", settings.deep_agent_thinking_budget)
+            extra_body["reasoning"] = {
+                "max_tokens": max(budget_tokens, 1024),  # OpenRouter minimum is 1024
+            }
+            log.info(f"Enabled OpenRouter reasoning for Anthropic with max_tokens={budget_tokens}")
+        elif settings.deep_agent_enable_thinking:
+            # Enable reasoning with default budget if thinking is enabled but no config provided
+            extra_body["reasoning"] = {
+                "max_tokens": max(settings.deep_agent_thinking_budget, 1024),
+            }
+            log.info(f"Enabled OpenRouter reasoning with default budget: {settings.deep_agent_thinking_budget}")
+        
+        # Use ChatOpenAI with OpenRouter's base URL
+        return ChatOpenAI(
+            model=openrouter_model_name,
+            api_key=settings.openrouter_api_key,
+            base_url=settings.openrouter_base_url,
+            streaming=True,
+            # OpenRouter-specific headers
+            default_headers={
+                "HTTP-Referer": "https://xfoundry.org",
+                "X-Title": "XFoundry Agent",
+            },
+            # Pass reasoning config via extra_body for OpenRouter
+            model_kwargs={"extra_body": extra_body} if extra_body else {},
+            **openrouter_kwargs,
+        )
+    elif settings.anthropic_api_key:
+        # Use direct Anthropic API - supports all Anthropic-specific features like extended thinking
+        log.info(f"Using direct Anthropic API for: {model_name}")
+        return init_chat_model(
+            f"anthropic:{model_name}",
+            api_key=settings.anthropic_api_key,
+            **model_kwargs,
+        )
+    else:
+        raise ValueError(
+            "No API key configured for Anthropic models. "
+            "Set either OPENROUTER_API_KEY (recommended) or ANTHROPIC_API_KEY."
+        )
+
 
 # =============================================================================
 # SYSTEM PROMPT
@@ -42,7 +130,7 @@ SYSTEM_PROMPT = """You are an AI assistant for Mentor Hub, a mentorship platform
    - Mark items in progress/completed as you go.
 2. **Context Management**: Use filesystem tools to store/retrieve large context.
 3. **Delegation**: Use the `task` tool to spawn subagents for specialized deep work.
-4. **Tools**: Knowledge graph search, live Mentor Hub data, and web research.
+4. **Tools**: Knowledge graph search, live Mentor Hub data, Outline documents, and web research.
 5. **Clarifications**: Use `request_clarifications` when key details are missing.
 
 ## Available Tool Categories
@@ -64,6 +152,12 @@ For current/real-time information:
 - `search_mentor_hub_mentors`: Find mentors by expertise
 - `get_mentor_hub_tasks`: Team tasks and blockers
 
+### Outline (Docs Knowledge Base)
+For internal documentation and policy references:
+- `outline_collections_list`: List collections (folders/categories)
+- `outline_documents_search`: Search documents by keywords/phrases
+- `outline_documents_info`: Read full document content (use IDs from search/list)
+
 ### Web Research (Firecrawl)
 For external information:
 - `firecrawl_search`: Web search
@@ -80,6 +174,7 @@ For missing or ambiguous details:
 1. **Choose the right tools**:
    - For current/live data (schedules, tasks, members): Use Mentor Hub tools
    - For historical context, relationships, program info: Use Cognee knowledge graph tools
+   - For internal documentation/policies: Use Outline tools
    - For external research: Use Firecrawl web tools
 
 2. **Plan before acting**: For any task that requires multiple tool calls or multi-step work,
@@ -98,6 +193,20 @@ For missing or ambiguous details:
    - Include an "other" option for custom input.
    - Do not ask follow-up clarifying questions in plain text; use the tool again.
    - Pause and wait for the user's response before proceeding.
+
+## Plan + Approval Workflow
+
+For any multi-step or structured deliverable (tables, calendars, multi-week schedules, reports):
+
+1. **Plan first**:
+   - Use `write_todos` to outline tasks.
+   - Write a user-facing plan to `/artifacts/<slug>-plan.md`.
+2. **Request approval**:
+   - Call `request_clarifications` with options like "approve", "request changes", "cancel".
+   - Wait for the user's response before continuing.
+3. **Execute after approval**:
+   - Create the final deliverable as `/artifacts/<slug>.md`.
+   - Summarize briefly in chat and reference the artifact.
 
 ## Artifacts
 
@@ -247,6 +356,8 @@ async def create_orchestrator_deep_agent(
     user_context: Optional[dict[str, Any]] = None,
     auth0_id: Optional[str] = None,
     selected_tools: Optional[list[str]] = None,
+    middleware: Optional[list[Any]] = None,
+    model_override: Optional[str] = None,
 ) -> CompiledStateGraph:
     """
     Create a Deep Agent orchestrator with all capabilities.
@@ -259,6 +370,7 @@ async def create_orchestrator_deep_agent(
         user_context: User details for personalization (name, role, teams)
         auth0_id: User ID for memory isolation
         selected_tools: Optional list of tool groups to enable (e.g., ["cognee", "firecrawl"])
+        model_override: Optional model name to use instead of default (from UI selection)
 
     Returns:
         Compiled Deep Agent graph ready for execution
@@ -269,36 +381,82 @@ async def create_orchestrator_deep_agent(
     logger.info(f"Creating Deep Agent for user: {user_id[:20]}...")
 
     # =========================================================================
-    # Initialize Model
+    # Initialize Model with Thinking Support
     # =========================================================================
-    model_name = settings.deep_agent_model or settings.default_orchestrator_model
+    # Use model_override if provided (from UI selection), otherwise fall back to settings
+    model_name = model_override or settings.deep_agent_model or settings.default_orchestrator_model
+    logger.info(f"Using model: {model_name}")
     model_name_lower = model_name.lower()
+    enable_thinking = settings.deep_agent_enable_thinking
+
+    # Determine provider and configure thinking
+    is_claude = "claude" in model_name_lower or "anthropic" in model_name_lower
+    is_gpt5 = "gpt-5" in model_name_lower or "gpt5" in model_name_lower
+    is_o_series = model_name_lower.startswith("o1") or model_name_lower.startswith("o3")
+
+    model_kwargs: dict[str, Any] = {}
+    # Note: Thinking extraction is handled by DeepAgentUIMiddleware.aafter_model()
+
+    # Configure thinking based on model type
+    if enable_thinking:
+        if is_claude:
+            # Claude extended thinking
+            model_kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": settings.deep_agent_thinking_budget,
+            }
+            logger.info(f"Enabled Claude thinking with {settings.deep_agent_thinking_budget} token budget")
+        elif is_gpt5 or is_o_series:
+            # GPT-5.x and o-series: use reasoning dict with effort AND summary
+            # This enables the Responses API which returns reasoning summaries
+            model_kwargs["reasoning"] = {
+                "effort": settings.deep_agent_reasoning_effort,
+                "summary": "auto",  # Request reasoning summary in responses
+            }
+            logger.info(f"Enabled {model_name} reasoning with effort={settings.deep_agent_reasoning_effort}, summary=auto")
 
     # Support different model providers
+    # Use ChatOpenAI directly for GPT-5.x to ensure reasoning parameter works
+    # Route Anthropic models through OpenRouter if configured
     if ":" in model_name:
         provider = model_name.split(":", 1)[0].lower()
+        actual_model_name = model_name.split(":", 1)[1]
+        
         if provider == "anthropic":
-            model = init_chat_model(
-                model_name,
-                api_key=settings.anthropic_api_key,
-            )
+            model = _create_anthropic_model(settings, actual_model_name, model_kwargs, logger)
         elif provider == "openai":
-            model = init_chat_model(
-                model_name,
-                api_key=settings.openai_api_key,
-            )
+            # Use ChatOpenAI directly for better reasoning support
+            if is_gpt5 or is_o_series:
+                model = ChatOpenAI(
+                    model=actual_model_name,
+                    api_key=settings.openai_api_key,
+                    **model_kwargs,
+                )
+                logger.info(f"Using ChatOpenAI directly for {actual_model_name} with reasoning support")
+            else:
+                model = init_chat_model(
+                    model_name,
+                    api_key=settings.openai_api_key,
+                    **model_kwargs,
+                )
         else:
-            model = init_chat_model(model_name)
-    elif "claude" in model_name_lower or "anthropic" in model_name_lower:
-        model = init_chat_model(
-            f"anthropic:{model_name}",
-            api_key=settings.anthropic_api_key,
+            model = init_chat_model(model_name, **model_kwargs)
+    elif is_claude:
+        model = _create_anthropic_model(settings, model_name, model_kwargs, logger)
+    elif is_gpt5 or is_o_series:
+        # Use ChatOpenAI directly for GPT-5.x/o-series models
+        model = ChatOpenAI(
+            model=model_name,
+            api_key=settings.openai_api_key,
+            **model_kwargs,
         )
+        logger.info(f"Using ChatOpenAI directly for {model_name} with reasoning support")
     else:
-        # Default to OpenAI
+        # Default to OpenAI via init_chat_model
         model = init_chat_model(
             f"openai:{model_name}",
             api_key=settings.openai_api_key,
+            **model_kwargs,
         )
 
     # =========================================================================
@@ -321,35 +479,40 @@ async def create_orchestrator_deep_agent(
 
     def make_backend(runtime):
         """
-        Create a CompositeBackend that routes:
-        - /memories/* -> Persistent Redis store (cross-conversation)
-        - /artifacts/saved/* -> Persistent Redis store (user-saved artifacts)
-        - /artifacts/* -> Ephemeral StateBackend (working artifacts)
-        - /* -> Ephemeral StateBackend (current session only)
+        Create a SimpleScopedStoreBackend that handles all path routing internally.
+
+        Path -> Namespace mapping (handled by SimpleScopedStoreBackend):
+        - /shared/* -> tenant-scoped (all staff can access)
+        - /artifacts/saved/* -> user-scoped (persists across threads)
+        - /memories/* -> user-scoped (persists across threads)
+        - /artifacts/* -> thread-scoped
+        - /context/* -> thread-scoped
+
+        Namespace hierarchy:
+        - tenant/shared/ for /shared/*
+        - tenant/users/{user_id}/saved/ for /artifacts/saved/*
+        - tenant/users/{user_id}/memories/ for /memories/*
+        - tenant/users/{user_id}/{thread_id}/artifacts/ for /artifacts/*
+        - tenant/users/{user_id}/{thread_id}/context/ for /context/*
         """
         try:
-            from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
-
-            # Default ephemeral backend for working files
-            ephemeral = StateBackend(runtime)
+            from deepagents.backends import StateBackend
+            from app.backends.simple_scoped_store_backend import SimpleScopedStoreBackend
 
             if not filesystem_enabled:
-                return ephemeral
+                return StateBackend(runtime)
 
-            # Try to set up persistent backend for memories and saved artifacts
+            # Use SimpleScopedStoreBackend directly - it handles all path routing internally
+            # Don't use CompositeBackend as it strips prefixes before passing to the backend,
+            # which breaks SimpleScopedStoreBackend's path-to-scope mapping
             if store:
-                logger.debug("Using store backend for /memories/ and /artifacts/saved/ persistence")
-                return CompositeBackend(
-                    default=ephemeral,
-                    routes={
-                        "/memories/": StoreBackend(runtime),
-                        "/artifacts/saved/": StoreBackend(runtime),
-                        # /artifacts/ without /saved/ remains ephemeral (default)
-                    },
-                )
+                logger.debug("Using SimpleScopedStoreBackend for persistent filesystem")
+                scoped_backend = SimpleScopedStoreBackend(runtime)
+                scoped_backend._store = store
+                return scoped_backend
 
-            # Fall back to all ephemeral
-            return ephemeral
+            # Fall back to ephemeral if no store
+            return StateBackend(runtime)
 
         except ImportError as e:
             logger.warning(f"Could not import deepagents backends: {e}")
@@ -398,6 +561,15 @@ async def create_orchestrator_deep_agent(
         else:
             logger.info("Deep Agent subagents disabled by configuration")
 
+        interrupt_on = None
+        if settings.deep_agent_enable_hitl and checkpointer:
+            interrupt_on = {
+                "write_file": {"allowed_decisions": ["approve", "edit", "reject"]},
+                "edit_file": {"allowed_decisions": ["approve", "edit", "reject"]},
+            }
+        elif settings.deep_agent_enable_hitl and not checkpointer:
+            logger.warning("Deep Agent HITL enabled but no checkpointer provided; disabling HITL.")
+
         agent_kwargs = {
             "model": model,
             "system_prompt": system_prompt,
@@ -411,6 +583,11 @@ async def create_orchestrator_deep_agent(
             agent_kwargs["backend"] = make_backend
         if store:
             agent_kwargs["store"] = store
+        if interrupt_on:
+            agent_kwargs["interrupt_on"] = interrupt_on
+
+        if middleware:
+            agent_kwargs["middleware"] = middleware
 
         agent = create_deep_agent(**agent_kwargs)
 
@@ -437,12 +614,17 @@ async def get_orchestrator_deep_agent(
     user_context: Optional[dict[str, Any]] = None,
     auth0_id: Optional[str] = None,
     selected_tools: Optional[list[str]] = None,
+    middleware: Optional[list[Any]] = None,
+    model_override: Optional[str] = None,
 ) -> CompiledStateGraph:
     """
     Get a Deep Agent orchestrator instance.
 
     This is the main entry point for the chat stream route.
     Alias for create_orchestrator_deep_agent for consistency with other orchestrators.
+    
+    Args:
+        model_override: Optional model name to use instead of default (from UI selection)
     """
     return await create_orchestrator_deep_agent(
         checkpointer=checkpointer,
@@ -450,4 +632,6 @@ async def get_orchestrator_deep_agent(
         user_context=user_context,
         auth0_id=auth0_id,
         selected_tools=selected_tools,
+        middleware=middleware,
+        model_override=model_override,
     )
