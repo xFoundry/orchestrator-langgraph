@@ -179,7 +179,7 @@ async def list_files(
 
     try:
         # Search for all items in this namespace using async method
-        items = [item async for item in store.asearch(namespace)]
+        items = list(await store.asearch(namespace))
 
         files = []
         for item in items:
@@ -295,7 +295,7 @@ async def get_file_tree(
             namespace = get_namespace_for_scope(scope, tenant_id, user_id, thread_id)
             logger.debug(f"[FileTree] Querying namespace for scope '{scope}': {namespace}")
             # Use async method to avoid blocking event loop
-            items = [item async for item in store.asearch(namespace)]
+            items = list(await store.asearch(namespace))
             logger.debug(f"[FileTree] Found {len(items)} items in scope '{scope}'")
             return [
                 FileInfo(

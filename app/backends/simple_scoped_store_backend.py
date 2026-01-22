@@ -228,9 +228,8 @@ class SimpleScopedStoreBackend(BackendProtocol):
 
     async def _async_ls(self, namespace: tuple) -> list:
         """Async list operation."""
-        # LangGraph Store.search() takes namespace as positional arg and is sync
-        # Use list() to convert the generator/iterator result
-        return list(self.store.search(namespace))
+        # Use async method to avoid blocking event loop
+        return list(await self.store.asearch(namespace))
 
     def read(self, file_path: str, offset: int = 0, limit: int = 2000) -> str:
         """Read file content with line numbers."""
@@ -258,8 +257,8 @@ class SimpleScopedStoreBackend(BackendProtocol):
 
     async def _async_read(self, namespace: tuple, key: str) -> Optional[str]:
         """Async read operation."""
-        # LangGraph Store.get() is sync and takes positional args
-        result = self.store.get(namespace, key)
+        # Use async method to avoid blocking event loop
+        result = await self.store.aget(namespace, key)
         if result and result.value:
             if isinstance(result.value, dict):
                 return result.value.get("content", "")
@@ -301,13 +300,13 @@ class SimpleScopedStoreBackend(BackendProtocol):
         scope: str
     ) -> None:
         """Async write operation."""
-        # LangGraph Store.put() is sync and takes positional args
+        # Use async method to avoid blocking event loop
         now = datetime.now(timezone.utc).isoformat()
         logger.info(f"[SimpleScopedStoreBackend] Writing file: path={path}, key={key}, scope={scope}")
         logger.info(f"[SimpleScopedStoreBackend] Namespace: {namespace}")
         cfg = self._get_config()
         logger.info(f"[SimpleScopedStoreBackend] Config: tenant_id={cfg.get('tenant_id')}, user_id={cfg.get('user_id', 'None')[:20] if cfg.get('user_id') else 'None'}..., thread_id={cfg.get('thread_id')}")
-        self.store.put(
+        await self.store.aput(
             namespace,
             key,
             {
