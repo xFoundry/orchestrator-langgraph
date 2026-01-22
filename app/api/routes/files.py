@@ -178,9 +178,8 @@ async def list_files(
     store = await get_store()
 
     try:
-        # Search for all items in this namespace
-        # LangGraph Store.search() is sync and takes namespace as positional arg
-        items = list(store.search(namespace))
+        # Search for all items in this namespace using async method
+        items = [item async for item in store.asearch(namespace)]
 
         files = []
         for item in items:
@@ -247,8 +246,8 @@ async def read_file(
     store = await get_store()
 
     try:
-        # LangGraph Store.get() is sync and takes positional args
-        result = store.get(namespace, key)
+        # Use async method
+        result = await store.aget(namespace, key)
 
         if not result:
             raise HTTPException(status_code=404, detail=f"File not found: {path}")
@@ -291,12 +290,12 @@ async def get_file_tree(
     store = await get_store()
     tree: list[FileTreeNode] = []
 
-    def get_files_for_scope(scope: str) -> list[FileInfo]:
+    async def get_files_for_scope(scope: str) -> list[FileInfo]:
         try:
             namespace = get_namespace_for_scope(scope, tenant_id, user_id, thread_id)
             logger.debug(f"[FileTree] Querying namespace for scope '{scope}': {namespace}")
-            # LangGraph Store.search() is sync and takes namespace as positional arg
-            items = list(store.search(namespace))
+            # Use async method to avoid blocking event loop
+            items = [item async for item in store.asearch(namespace)]
             logger.debug(f"[FileTree] Found {len(items)} items in scope '{scope}'")
             return [
                 FileInfo(
@@ -314,7 +313,7 @@ async def get_file_tree(
     # Thread-scoped files
     if include_thread and thread_id:
         # Artifacts folder
-        artifacts = get_files_for_scope("thread_artifacts")
+        artifacts = await get_files_for_scope("thread_artifacts")
         if artifacts:
             tree.append(FileTreeNode(
                 name="artifacts",
@@ -327,7 +326,7 @@ async def get_file_tree(
             ))
 
         # Context folder
-        context = get_files_for_scope("thread_context")
+        context = await get_files_for_scope("thread_context")
         if context:
             tree.append(FileTreeNode(
                 name="context",
@@ -342,7 +341,7 @@ async def get_file_tree(
     # User-scoped files
     if include_user:
         # Saved artifacts
-        saved = get_files_for_scope("user_saved")
+        saved = await get_files_for_scope("user_saved")
         if saved:
             # Find or create artifacts folder, then add saved subfolder
             artifacts_folder = next((n for n in tree if n.path == "/artifacts"), None)
@@ -366,7 +365,7 @@ async def get_file_tree(
                 ))
 
         # Memories
-        memories = get_files_for_scope("user_memories")
+        memories = await get_files_for_scope("user_memories")
         if memories:
             tree.append(FileTreeNode(
                 name="memories",
@@ -380,7 +379,7 @@ async def get_file_tree(
 
     # Tenant-scoped files
     if include_tenant:
-        shared = get_files_for_scope("tenant")
+        shared = await get_files_for_scope("tenant")
         if shared:
             tree.append(FileTreeNode(
                 name="shared",
@@ -445,8 +444,8 @@ async def promote_file(
 
     # Read source file
     try:
-        # LangGraph Store.get() is sync and takes positional args
-        result = store.get(source_namespace, source_key)
+        # Use async method
+        result = await store.aget(source_namespace, source_key)
         if not result:
             raise HTTPException(status_code=404, detail=f"Source file not found: {source_path}")
 
@@ -468,8 +467,8 @@ async def promote_file(
             source_value["path"] = target_path
             source_value["promoted_from"] = source_path
 
-        # LangGraph Store.put() is sync and takes positional args
-        store.put(target_namespace, target_key, source_value)
+        # Use async method
+        await store.aput(target_namespace, target_key, source_value)
 
         return PromoteFileResponse(
             success=True,
