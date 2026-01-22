@@ -296,16 +296,36 @@ async def get_file_tree(
             logger.debug(f"[FileTree] Querying namespace for scope '{scope}': {namespace}")
             # Use async method to avoid blocking event loop
             items = list(await store.asearch(namespace))
-            logger.debug(f"[FileTree] Found {len(items)} items in scope '{scope}'")
-            return [
-                FileInfo(
+            logger.debug(f"[FileTree] asearch returned {len(items)} items for scope '{scope}'")
+
+            # Filter to only include actual files, not thread metadata
+            file_items = []
+            for item in items:
+                # Skip thread metadata items (they belong in /threads, not file tree)
+                if item.key.startswith("thread-"):
+                    logger.debug(f"[FileTree] Skipping thread metadata: {item.key}")
+                    continue
+
+                # Validate this is a file with proper structure
+                if not isinstance(item.value, dict):
+                    logger.debug(f"[FileTree] Skipping non-dict item: {item.key}")
+                    continue
+
+                # Files must have 'content' and 'path' fields
+                # Thread metadata has 'title', 'updated_at', 'user_id' instead
+                if "content" not in item.value or "path" not in item.value:
+                    logger.debug(f"[FileTree] Skipping item without file structure: {item.key}")
+                    continue
+
+                file_items.append(FileInfo(
                     key=item.key,
                     path=get_virtual_path_for_scope(scope, item.key),
-                    size=len(item.value.get("content", "")) if isinstance(item.value, dict) else 0,
+                    size=len(item.value.get("content", "")),
                     scope=scope,
-                )
-                for item in items
-            ]
+                ))
+
+            logger.debug(f"[FileTree] Filtered to {len(file_items)} valid files in scope '{scope}'")
+            return file_items
         except Exception as e:
             logger.warning(f"Error getting files for scope {scope}: {e}")
             return []

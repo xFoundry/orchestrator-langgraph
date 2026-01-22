@@ -11,6 +11,7 @@ Provides REST endpoints for:
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Optional, Any
 
@@ -21,6 +22,20 @@ from app.persistence.redis import get_store, get_checkpointer, get_thread_config
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/threads", tags=["threads"])
+
+# Simple in-memory cache for thread listings (60 second TTL per user)
+# Helps reduce load when multiple users poll frequently
+_thread_list_cache: dict[str, tuple[float, list]] = {}
+
+
+def _invalidate_thread_cache(user_id: str, tenant_id: str = "default") -> None:
+    """Invalidate cached thread list for a user."""
+    # Remove all cache entries for this user (any limit/offset)
+    keys_to_delete = [k for k in _thread_list_cache.keys() if k.startswith(f"{tenant_id}:{user_id}:")]
+    for key in keys_to_delete:
+        del _thread_list_cache[key]
+    if keys_to_delete:
+        logger.debug(f"[Threads] Invalidated {len(keys_to_delete)} cache entries for user_id={user_id[:20]}...")
 
 
 # =============================================================================
@@ -132,6 +147,10 @@ async def get_or_create_thread_metadata(
 
         # Update in store (await for async stores)
         await store.aput(namespace, thread_id, metadata.model_dump())
+
+        # Invalidate cache so changes are visible immediately
+        _invalidate_thread_cache(user_id, tenant_id)
+
         return metadata
 
     # Create new thread metadata
@@ -159,6 +178,9 @@ async def get_or_create_thread_metadata(
     # Store metadata (await for async stores)
     await store.aput(namespace, thread_id, metadata.model_dump())
     logger.debug(f"Created thread metadata: {thread_id}")
+
+    # Invalidate cache so new thread appears immediately in sidebar
+    _invalidate_thread_cache(user_id, tenant_id)
 
     return metadata
 
@@ -198,7 +220,35 @@ async def list_threads(
     List threads for a user.
 
     Returns threads sorted by last_message_at (most recent first).
+    Uses a 30-second cache per user to reduce load during frequent polling.
     """
+    # Check cache first (30 second TTL)
+    cache_key = f"{tenant_id}:{user_id}:{limit}:{offset}"
+    now = time.time()
+
+    if cache_key in _thread_list_cache:
+        cached_time, cached_threads = _thread_list_cache[cache_key]
+        if now - cached_time < 30:  # 30 second cache
+            logger.debug(f"[Threads] Returning cached threads for user_id={user_id[:20]}... (age: {now - cached_time:.1f}s)")
+            # Convert cached data back to response format
+            response_threads = [
+                ThreadResponse(
+                    id=t.id,
+                    title=t.title,
+                    created_at=t.created_at,
+                    updated_at=t.updated_at,
+                    last_message_at=t.last_message_at,
+                    message_count=t.message_count,
+                    is_starred=t.is_starred,
+                )
+                for t in cached_threads
+            ]
+            return ThreadListResponse(
+                threads=response_threads,
+                total=len(cached_threads),
+                hasMore=False,
+            )
+
     store = await get_store()
     namespace = get_thread_metadata_namespace(tenant_id, user_id)
 
@@ -207,16 +257,32 @@ async def list_threads(
     try:
         # Get all thread metadata for this user (use async search)
         items = await store.asearch(namespace)
-        logger.debug(f"[Threads] Found {len(items)} threads")
+        logger.debug(f"[Threads] asearch returned {len(items)} items")
 
-        # Parse into ThreadMetadata objects
+        # Parse into ThreadMetadata objects with strict validation
         threads: list[ThreadMetadata] = []
         for item in items:
+            # Skip items that don't have the expected thread ID format
+            # Thread IDs should start with "thread-" to distinguish from artifacts
+            if not item.key.startswith("thread-"):
+                logger.debug(f"[Threads] Skipping non-thread item with key: {item.key}")
+                continue
+
+            # Validate that item.value is a dict and has required ThreadMetadata fields
+            if not isinstance(item.value, dict):
+                logger.debug(f"[Threads] Skipping item {item.key}: value is not a dict")
+                continue
+
+            required_fields = {"id", "title", "updated_at", "user_id"}
+            if not required_fields.issubset(item.value.keys()):
+                logger.debug(f"[Threads] Skipping item {item.key}: missing required fields {required_fields - item.value.keys()}")
+                continue
+
             try:
                 metadata = ThreadMetadata(**item.value)
                 threads.append(metadata)
             except Exception as e:
-                logger.warning(f"Failed to parse thread metadata {item.key}: {e}")
+                logger.warning(f"[Threads] Failed to parse thread metadata {item.key}: {e}")
                 continue
 
         # Sort by last_message_at (most recent first)
@@ -224,6 +290,15 @@ async def list_threads(
             key=lambda t: t.last_message_at or t.updated_at,
             reverse=True
         )
+
+        # Cache the full thread list before pagination (for next request)
+        # Only cache if offset=0 to ensure we cache the full list
+        if offset == 0:
+            _thread_list_cache[cache_key] = (now, threads)
+            # Clean old cache entries (older than 5 minutes)
+            keys_to_delete = [k for k, (t, _) in _thread_list_cache.items() if now - t > 300]
+            for k in keys_to_delete:
+                del _thread_list_cache[k]
 
         # Apply pagination
         total = len(threads)
@@ -434,6 +509,9 @@ async def update_thread(
     # Save back
     await store.aput(namespace, thread_id, metadata.model_dump())
 
+    # Invalidate cache so updates are visible immediately
+    _invalidate_thread_cache(user_id, tenant_id)
+
     return ThreadResponse(
         id=metadata.id,
         title=metadata.title,
@@ -467,5 +545,8 @@ async def delete_thread(
 
     # Delete metadata
     await store.adelete(namespace, thread_id)
+
+    # Invalidate cache so deletion is visible immediately
+    _invalidate_thread_cache(user_id, tenant_id)
 
     return {"success": True, "message": f"Thread {thread_id} deleted"}
