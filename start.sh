@@ -18,7 +18,12 @@ if [ "$MODE" = "true" ] || [ "$MODE" = "1" ]; then
 fi
 
 echo "Starting FastAPI orchestrator..."
+# Use multiple workers for concurrent request handling (default: 4)
+# For 80-90 users with 100 concurrent chats, 4-8 workers is recommended
+WORKERS="${UVICORN_WORKERS:-4}"
+echo "Using ${WORKERS} uvicorn workers for concurrent streaming..."
+
 if command -v python >/dev/null 2>&1; then
-  exec python -m uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}"
+  exec python -m uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}" --workers "$WORKERS"
 fi
-exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}"
+exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}" --workers "$WORKERS"
