@@ -5,23 +5,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from typing import AsyncGenerator, Any, Union
+from typing import Any, AsyncGenerator, Union
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from langgraph.errors import GraphRecursionError
 
+from app.api.routes.threads import update_thread_activity
 from app.models.chat import (
     ChatRequest,
-    ContentBlock,
-    TextContentBlock,
-    ImageContentBlock,
     FileContentBlock,
+    ImageContentBlock,
+    TextContentBlock,
 )
 from app.persistence.redis import get_thread_config
-from app.streaming import LangGraphEventMapper, SSEEvent, SSEEventType, ErrorData
+from app.streaming import LangGraphEventMapper
 from app.streaming.deep_agent_event_mapper import DeepAgentEventMapper
-from app.api.routes.threads import update_thread_activity
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -30,11 +29,11 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 def build_message_content(request: ChatRequest) -> Union[str, list[dict[str, Any]]]:
     """
     Build message content from ChatRequest, supporting both legacy text and multimodal.
-    
+
     Returns:
         - str: If only text content (legacy or single text block)
         - list[dict]: If multimodal content (images, files, mixed)
-    
+
     Output format follows LangChain standard content blocks:
     - Text: {"type": "text", "text": "..."}
     - Image (base64): {"type": "image", "base64": "...", "mime_type": "image/jpeg"}
@@ -45,7 +44,7 @@ def build_message_content(request: ChatRequest) -> Union[str, list[dict[str, Any
     # If multimodal content is provided, use it (takes precedence)
     if request.content:
         content_blocks: list[dict[str, Any]] = []
-        
+
         for block in request.content:
             if isinstance(block, dict):
                 # Already a dict, pass through (handle raw dicts from frontend)
@@ -76,13 +75,13 @@ def build_message_content(request: ChatRequest) -> Union[str, list[dict[str, Any
                 if block.metadata:
                     file_block["metadata"] = block.metadata
                 content_blocks.append(file_block)
-        
+
         # Optimization: if only a single text block, return as string
         if len(content_blocks) == 1 and content_blocks[0].get("type") == "text":
             return content_blocks[0]["text"]
-        
+
         return content_blocks
-    
+
     # Fallback to legacy message field
     return request.message or ""
 
@@ -91,12 +90,12 @@ def extract_text_from_content(content: Union[str, list[dict[str, Any]]]) -> str:
     """Extract text content for query field (v3 orchestrator compatibility)."""
     if isinstance(content, str):
         return content
-    
+
     text_parts = []
     for block in content:
         if isinstance(block, dict) and block.get("type") == "text":
             text_parts.append(block.get("text", ""))
-    
+
     return " ".join(text_parts)
 
 
@@ -205,12 +204,14 @@ async def sse_event_generator(
         # Extract text for query field and memory instructions
         text_content = extract_text_from_content(message_content)
 
-        # Track thread metadata for thread history
+        # Track thread metadata for thread history (including model used)
+        model_used = getattr(request, "model_override", None)
         await update_thread_activity(
             thread_id=thread_id,
             user_id=request.user_id or "anonymous",
             tenant_id=request.tenant_id,
             message_text=text_content,
+            model=model_used,
         )
 
         # Add memory instruction if needed (prepend to text content)
@@ -228,7 +229,7 @@ async def sse_event_generator(
                 ] + [b for b in message_content if b.get("type") != "text"]
                 # Update text_content for query field
                 text_content = memory_instruction + text_content
-        
+
         # Log multimodal content info
         if isinstance(message_content, list):
             block_types = [b.get("type", "unknown") for b in message_content]
@@ -314,11 +315,11 @@ async def chat_stream(request: ChatRequest, req: Request) -> StreamingResponse:
     ## Multimodal Support
 
     This endpoint supports multimodal input (images and PDFs) via content blocks.
-    
+
     **Supported formats:**
     - Images: JPEG, PNG, GIF, WEBP (via base64 or URL)
     - Documents: PDF (via base64 or URL)
-    
+
     **Model compatibility:**
     - GPT-5.2+: Images ✅, PDFs ❌ (needs preprocessing)
     - Claude 4.5+: Images ✅, PDFs ✅
@@ -380,9 +381,9 @@ async def stream_health() -> dict:
         "service": "orchestrator-chat-stream",
         "features": [
             "sse",
-            "agent_activity", 
-            "text_chunks", 
-            "citations", 
+            "agent_activity",
+            "text_chunks",
+            "citations",
             "thinking",
             "multimodal",
         ],

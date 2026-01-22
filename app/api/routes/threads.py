@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from app.persistence.redis import get_store, get_checkpointer, get_thread_config
+from app.persistence.redis import get_store, get_thread_config
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/threads", tags=["threads"])
@@ -39,6 +39,7 @@ class ThreadMetadata(BaseModel):
     is_starred: bool = Field(False, description="Whether thread is starred")
     is_archived: bool = Field(False, description="Whether thread is archived")
     archived_at: Optional[str] = Field(None, description="ISO timestamp when thread was archived")
+    model: Optional[str] = Field(None, description="Last model used in this thread")
     user_id: str = Field(..., description="Owner user ID")
     tenant_id: str = Field("default", description="Tenant ID")
     first_message: Optional[str] = Field(None, description="First user message (for title generation)")
@@ -55,6 +56,7 @@ class ThreadResponse(BaseModel):
     message_count: int = 0
     is_starred: bool = False
     is_archived: bool = False
+    model: Optional[str] = None
 
 
 class ThreadListResponse(BaseModel):
@@ -71,6 +73,7 @@ class UpdateThreadRequest(BaseModel):
     title: Optional[str] = None
     is_starred: Optional[bool] = None
     is_archived: Optional[bool] = None
+    model: Optional[str] = None
 
 
 class ThreadMessage(BaseModel):
@@ -112,6 +115,7 @@ async def get_or_create_thread_metadata(
     user_id: str,
     tenant_id: str = "default",
     first_message: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> ThreadMetadata:
     """
     Get existing thread metadata or create new entry.
@@ -132,10 +136,13 @@ async def get_or_create_thread_metadata(
         metadata.updated_at = now
         metadata.last_message_at = now
         metadata.message_count += 1
+        # Update model if provided (track last model used)
+        if model:
+            metadata.model = model
 
         # Update in store (await for async stores)
         await store.aput(namespace, thread_id, metadata.model_dump())
-        logger.info(f"[Threads] UPDATED existing thread: id={thread_id}, title={metadata.title}, msg_count={metadata.message_count}")
+        logger.info(f"[Threads] UPDATED existing thread: id={thread_id}, title={metadata.title}, msg_count={metadata.message_count}, model={metadata.model}")
 
         return metadata
 
@@ -156,6 +163,7 @@ async def get_or_create_thread_metadata(
         last_message_at=now,
         message_count=1,
         is_starred=False,
+        model=model,
         user_id=user_id,
         tenant_id=tenant_id,
         first_message=first_message,
@@ -180,9 +188,10 @@ async def update_thread_activity(
     user_id: str,
     tenant_id: str = "default",
     message_text: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> None:
     """
-    Update thread activity timestamp and message count.
+    Update thread activity timestamp, message count, and last used model.
 
     Called after each message to keep metadata current.
     """
@@ -191,6 +200,7 @@ async def update_thread_activity(
         user_id=user_id,
         tenant_id=tenant_id,
         first_message=message_text,
+        model=model,
     )
 
 
@@ -354,6 +364,7 @@ async def list_threads(
                 message_count=t.message_count,
                 is_starred=t.is_starred,
                 is_archived=t.is_archived,
+                model=t.model,
             )
             for t in threads
         ]
@@ -395,6 +406,7 @@ async def get_thread(
         message_count=metadata.message_count,
         is_starred=metadata.is_starred,
         is_archived=metadata.is_archived,
+        model=metadata.model,
     )
 
 
@@ -552,6 +564,8 @@ async def update_thread(
             metadata.archived_at = now
         else:
             metadata.archived_at = None
+    if request.model is not None:
+        metadata.model = request.model
 
     metadata.updated_at = now
 
@@ -567,6 +581,7 @@ async def update_thread(
         message_count=metadata.message_count,
         is_starred=metadata.is_starred,
         is_archived=metadata.is_archived,
+        model=metadata.model,
     )
 
 
