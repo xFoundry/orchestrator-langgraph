@@ -37,6 +37,8 @@ class ThreadMetadata(BaseModel):
     last_message_at: Optional[str] = Field(None, description="ISO timestamp of last message")
     message_count: int = Field(0, description="Number of messages in thread")
     is_starred: bool = Field(False, description="Whether thread is starred")
+    is_archived: bool = Field(False, description="Whether thread is archived")
+    archived_at: Optional[str] = Field(None, description="ISO timestamp when thread was archived")
     user_id: str = Field(..., description="Owner user ID")
     tenant_id: str = Field("default", description="Tenant ID")
     first_message: Optional[str] = Field(None, description="First user message (for title generation)")
@@ -52,6 +54,7 @@ class ThreadResponse(BaseModel):
     last_message_at: Optional[str] = None
     message_count: int = 0
     is_starred: bool = False
+    is_archived: bool = False
 
 
 class ThreadListResponse(BaseModel):
@@ -67,6 +70,7 @@ class UpdateThreadRequest(BaseModel):
 
     title: Optional[str] = None
     is_starred: Optional[bool] = None
+    is_archived: Optional[bool] = None
 
 
 class ThreadMessage(BaseModel):
@@ -265,11 +269,15 @@ async def list_threads(
     tenant_id: str = Query("default", description="Tenant ID"),
     limit: int = Query(50, description="Maximum threads to return", ge=1, le=100),
     offset: int = Query(0, description="Offset for pagination", ge=0),
+    include_archived: bool = Query(False, description="Include archived threads"),
+    archived_only: bool = Query(False, description="Return only archived threads"),
 ):
     """
     List threads for a user.
 
     Returns threads sorted by last_message_at (most recent first).
+    By default, archived threads are excluded. Use include_archived=true to include them,
+    or archived_only=true to get only archived threads.
     """
     logger.critical(f"===== LIST_THREADS CALLED: user_id={user_id[:20]}..., tenant_id={tenant_id}, limit={limit}, offset={offset} =====")
 
@@ -316,6 +324,14 @@ async def list_threads(
 
         logger.info(f"[Threads] After filtering: {len(threads)} valid threads found")
 
+        # Filter by archive status
+        if archived_only:
+            threads = [t for t in threads if t.is_archived]
+            logger.info(f"[Threads] Filtered to archived only: {len(threads)} threads")
+        elif not include_archived:
+            threads = [t for t in threads if not t.is_archived]
+            logger.info(f"[Threads] Filtered out archived: {len(threads)} threads")
+
         # Sort by last_message_at (most recent first)
         threads.sort(
             key=lambda t: t.last_message_at or t.updated_at,
@@ -337,6 +353,7 @@ async def list_threads(
                 last_message_at=t.last_message_at,
                 message_count=t.message_count,
                 is_starred=t.is_starred,
+                is_archived=t.is_archived,
             )
             for t in threads
         ]
@@ -377,6 +394,7 @@ async def get_thread(
         last_message_at=metadata.last_message_at,
         message_count=metadata.message_count,
         is_starred=metadata.is_starred,
+        is_archived=metadata.is_archived,
     )
 
 
@@ -521,12 +539,21 @@ async def update_thread(
     metadata = ThreadMetadata(**result.value)
 
     # Apply updates
+    now = datetime.now(timezone.utc).isoformat()
+
     if request.title is not None:
         metadata.title = request.title
     if request.is_starred is not None:
         metadata.is_starred = request.is_starred
+    if request.is_archived is not None:
+        metadata.is_archived = request.is_archived
+        # Set archived_at timestamp when archiving, clear it when unarchiving
+        if request.is_archived:
+            metadata.archived_at = now
+        else:
+            metadata.archived_at = None
 
-    metadata.updated_at = datetime.now(timezone.utc).isoformat()
+    metadata.updated_at = now
 
     # Save back
     await store.aput(namespace, thread_id, metadata.model_dump())
@@ -539,6 +566,7 @@ async def update_thread(
         last_message_at=metadata.last_message_at,
         message_count=metadata.message_count,
         is_starred=metadata.is_starred,
+        is_archived=metadata.is_archived,
     )
 
 
