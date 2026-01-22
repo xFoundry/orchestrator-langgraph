@@ -147,6 +147,7 @@ async def get_or_create_thread_metadata(
 
         # Update in store (await for async stores)
         await store.aput(namespace, thread_id, metadata.model_dump())
+        logger.info(f"[Threads] UPDATED existing thread: id={thread_id}, title={metadata.title}, msg_count={metadata.message_count}")
 
         # Invalidate cache so changes are visible immediately
         _invalidate_thread_cache(user_id, tenant_id)
@@ -177,7 +178,14 @@ async def get_or_create_thread_metadata(
 
     # Store metadata (await for async stores)
     await store.aput(namespace, thread_id, metadata.model_dump())
-    logger.debug(f"Created thread metadata: {thread_id}")
+    logger.info(f"[Threads] Created NEW thread metadata: id={thread_id}, title={metadata.title}, namespace={namespace}")
+
+    # Verify it was stored
+    verify = await store.aget(namespace, thread_id)
+    if verify:
+        logger.info(f"[Threads] ✓ Verified thread {thread_id} was stored successfully")
+    else:
+        logger.error(f"[Threads] ✗ FAILED to verify thread {thread_id} storage!")
 
     # Invalidate cache so new thread appears immediately in sidebar
     _invalidate_thread_cache(user_id, tenant_id)
@@ -209,6 +217,70 @@ async def update_thread_activity(
 # =============================================================================
 
 
+@router.get("/debug", response_model=dict)
+async def debug_threads(
+    user_id: str = Query(..., description="User ID"),
+    tenant_id: str = Query("default", description="Tenant ID"),
+    test_write: bool = Query(False, description="Test writing multiple items"),
+):
+    """DEBUG endpoint to see raw Redis data and test store behavior."""
+    store = await get_store()
+    namespace = get_thread_metadata_namespace(tenant_id, user_id)
+
+    logger.critical(f"===== DEBUG_THREADS: namespace={namespace}, test_write={test_write} =====")
+
+    # Optionally test writing multiple items
+    if test_write:
+        logger.critical("===== TESTING: Writing 3 test threads =====")
+        for i in range(1, 4):
+            test_thread_id = f"test-thread-{i}"
+            test_data = {
+                "id": test_thread_id,
+                "title": f"Test Thread {i}",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "last_message_at": datetime.now(timezone.utc).isoformat(),
+                "message_count": 1,
+                "is_starred": False,
+                "user_id": user_id,
+                "tenant_id": tenant_id,
+            }
+            await store.aput(namespace, test_thread_id, test_data)
+            logger.critical(f"  - Wrote {test_thread_id}")
+
+        logger.critical("===== TESTING: Verifying writes =====")
+        for i in range(1, 4):
+            test_thread_id = f"test-thread-{i}"
+            result = await store.aget(namespace, test_thread_id)
+            if result:
+                logger.critical(f"  - ✓ Found {test_thread_id}")
+            else:
+                logger.critical(f"  - ✗ NOT FOUND: {test_thread_id}")
+
+    # Get ALL items without any filtering
+    items = await store.asearch(namespace)
+
+    raw_data = []
+    for item in items:
+        raw_data.append({
+            "key": item.key,
+            "value_type": str(type(item.value)),
+            "value_keys": list(item.value.keys()) if isinstance(item.value, dict) else None,
+            "value": item.value if isinstance(item.value, dict) else str(item.value)[:100]
+        })
+
+    logger.critical(f"===== DEBUG: Found {len(items)} raw items after operations =====")
+    for data in raw_data:
+        logger.critical(f"  - {data['key']}: {data.get('value_keys', 'N/A')}")
+
+    return {
+        "namespace": namespace,
+        "total_items": len(items),
+        "items": raw_data,
+        "test_write_performed": test_write
+    }
+
+
 @router.get("", response_model=ThreadListResponse)
 async def list_threads(
     user_id: str = Query(..., description="User ID"),
@@ -222,6 +294,8 @@ async def list_threads(
     Returns threads sorted by last_message_at (most recent first).
     Uses a 30-second cache per user to reduce load during frequent polling.
     """
+    logger.critical(f"===== LIST_THREADS CALLED: user_id={user_id[:20]}..., tenant_id={tenant_id}, limit={limit}, offset={offset} =====")
+
     # Check cache first (30 second TTL)
     cache_key = f"{tenant_id}:{user_id}:{limit}:{offset}"
     now = time.time()
@@ -257,7 +331,11 @@ async def list_threads(
     try:
         # Get all thread metadata for this user (use async search)
         items = await store.asearch(namespace)
-        logger.debug(f"[Threads] asearch returned {len(items)} items")
+        logger.info(f"[Threads] asearch returned {len(items)} raw items from namespace {namespace}")
+
+        # Debug: log all item keys
+        if items:
+            logger.info(f"[Threads] Raw item keys: {[item.key for item in items]}")
 
         # Parse into ThreadMetadata objects with strict validation
         threads: list[ThreadMetadata] = []
@@ -281,9 +359,12 @@ async def list_threads(
             try:
                 metadata = ThreadMetadata(**item.value)
                 threads.append(metadata)
+                logger.info(f"[Threads] Successfully parsed thread: {item.key} - title: {metadata.title}")
             except Exception as e:
                 logger.warning(f"[Threads] Failed to parse thread metadata {item.key}: {e}")
                 continue
+
+        logger.info(f"[Threads] After filtering: {len(threads)} valid threads found")
 
         # Sort by last_message_at (most recent first)
         threads.sort(
@@ -295,10 +376,12 @@ async def list_threads(
         # Only cache if offset=0 to ensure we cache the full list
         if offset == 0:
             _thread_list_cache[cache_key] = (now, threads)
+            logger.info(f"[Threads] Cached {len(threads)} threads for key {cache_key}")
             # Clean old cache entries (older than 5 minutes)
             keys_to_delete = [k for k, (t, _) in _thread_list_cache.items() if now - t > 300]
             for k in keys_to_delete:
                 del _thread_list_cache[k]
+                logger.debug(f"[Threads] Cleaned old cache entry: {k}")
 
         # Apply pagination
         total = len(threads)
