@@ -103,12 +103,12 @@ class ToolRegistry:
         return "\n".join(lines)
 
 
-def create_default_registry(user_id: Optional[str] = None) -> ToolRegistry:
+async def create_default_registry(user_id: Optional[str] = None) -> ToolRegistry:
     """
     Factory function to create a registry with all default tools.
 
     Args:
-        user_id: User ID for user-specific tools (e.g., memory).
+        user_id: User ID for user-specific tools (e.g., memory, integrations).
 
     Returns:
         ToolRegistry populated with all available tool groups.
@@ -262,6 +262,29 @@ def create_default_registry(user_id: Optional[str] = None) -> ToolRegistry:
             logger.info("Registered interaction tool group")
     except ImportError as e:
         logger.warning(f"Could not import interaction tools: {e}")
+
+    # =========================================================================
+    # USER INTEGRATIONS (Wrike, Linear, GitHub, Slack, etc.) - requires user_id
+    # =========================================================================
+    if user_id:
+        try:
+            from app.tools.integration_mcp_tools import get_user_integration_tools
+
+            integration_tools = await get_user_integration_tools(user_id)
+            if integration_tools:
+                registry.register_group(
+                    ToolGroup(
+                        name="user_integrations",
+                        tools=integration_tools,
+                        description="User-configured integrations (Wrike, Linear, GitHub, Slack, etc.). "
+                        "Tools are loaded from MCP servers based on user's enabled integrations.",
+                    )
+                )
+                logger.info(f"Registered {len(integration_tools)} user integration tools")
+        except ImportError as e:
+            logger.warning(f"Could not import integration MCP tools: {e}")
+        except Exception as e:
+            logger.error(f"Failed to load user integration tools: {e}")
 
     return registry
 

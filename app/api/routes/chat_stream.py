@@ -11,7 +11,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from langgraph.errors import GraphRecursionError
 
-from app.api.routes.threads import update_thread_activity
+from app.api.routes.threads import update_thread_activity, get_or_create_thread_metadata
 from app.models.chat import (
     ChatRequest,
     FileContentBlock,
@@ -21,6 +21,8 @@ from app.models.chat import (
 from app.persistence.redis import get_thread_config
 from app.streaming import LangGraphEventMapper
 from app.streaming.deep_agent_event_mapper import DeepAgentEventMapper
+from app.streaming.sse_events import SSEEvent, SSEEventType, ThreadTitleData
+from app.utils.thread_title import generate_thread_title
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -278,6 +280,54 @@ async def sse_event_generator(
 
             # Allow other tasks to run
             await asyncio.sleep(0)
+
+        # Generate AI title for new threads (after first response)
+        try:
+            user_id = request.user_id or "anonymous"
+            tenant_id = request.tenant_id or "default"
+
+            # Check if thread needs a title (only for new conversations)
+            metadata = await get_or_create_thread_metadata(
+                thread_id=thread_id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+            )
+
+            # Generate title if the current title is just the truncated first message
+            # (indicates it hasn't been AI-generated yet)
+            first_message_preview = text_content[:50].strip()
+            needs_title = (
+                metadata.title == "New conversation"
+                or metadata.title.startswith(first_message_preview[:20])
+            )
+
+            if needs_title and mapper.accumulated_text:
+                # Build messages for title generation
+                messages = [
+                    {"type": "human", "content": text_content},
+                    {"type": "ai", "content": mapper.accumulated_text},
+                ]
+                title = await generate_thread_title(messages)
+                if title:
+                    # Emit title event
+                    title_event = SSEEvent(
+                        event=SSEEventType.THREAD_TITLE,
+                        data=ThreadTitleData(title=title, thread_id=thread_id),
+                    )
+                    yield title_event.to_sse_string()
+
+                    # Update thread metadata with the generated title
+                    from app.api.routes.threads import get_thread_metadata_namespace
+                    from app.persistence.redis import get_store
+
+                    store = await get_store()
+                    namespace = get_thread_metadata_namespace(tenant_id, user_id)
+                    metadata.title = title
+                    await store.aput(namespace, thread_id, metadata.model_dump())
+                    logger.info(f"Updated thread {thread_id} with AI-generated title: {title}")
+
+        except Exception as e:
+            logger.warning(f"Failed to generate thread title: {e}")
 
         # Emit final complete event
         complete_event = mapper.create_complete_event(thread_id)

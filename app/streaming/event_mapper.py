@@ -7,6 +7,7 @@ import re
 import time
 from typing import Any, Optional
 
+from app.tools.sanitize import make_json_serializable
 from app.streaming.sse_events import (
     SSEEvent,
     SSEEventType,
@@ -17,6 +18,7 @@ from app.streaming.sse_events import (
     ToolResultData,
     ThinkingData,
     ArtifactData,
+    ThreadTitleData,
     CompleteData,
     ErrorData,
 )
@@ -175,11 +177,14 @@ class LangGraphEventMapper:
             # Create human-readable description
             tool_description = self._get_tool_description(tool_name, tool_input)
 
+            # Sanitize tool_input to remove non-serializable objects (e.g., AsyncCallbackManager)
+            safe_tool_input = make_json_serializable(tool_input)
+
             activity = AgentActivityData(
                 agent=self._current_agent,
                 action="tool_call",
                 tool_name=tool_name,
-                tool_args=tool_input if isinstance(tool_input, dict) else {"input": tool_input},
+                tool_args=safe_tool_input if isinstance(safe_tool_input, dict) else {"input": safe_tool_input},
                 details=tool_description,
                 timestamp=timestamp,
             )
@@ -281,6 +286,22 @@ class LangGraphEventMapper:
             elif event_type == "handoff":
                 self._handoff_summary = custom_data.get("summary")
                 self._handoff_recent_messages = custom_data.get("recent_messages")
+
+            elif event_type == "ui":
+                # UI events can contain various frontend updates
+                ui_name = custom_data.get("name")
+                ui_props = custom_data.get("props", {})
+
+                if ui_name == "thread_title":
+                    # AI-generated thread title
+                    title = ui_props.get("title")
+                    if title:
+                        sse_events.append(
+                            SSEEvent(
+                                event=SSEEventType.THREAD_TITLE,
+                                data=ThreadTitleData(title=title),
+                            )
+                        )
 
         elif kind == "on_chain_start":
             # Subgraph/chain invocation - only show meaningful delegations

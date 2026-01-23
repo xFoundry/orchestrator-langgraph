@@ -2,6 +2,7 @@
 Outline MCP client (Streamable HTTP JSON-RPC).
 
 Handles initialize handshake and session header reuse for tools/list and tools/call.
+Includes retry logic for transient server errors (502, 503, 504).
 """
 
 from __future__ import annotations
@@ -16,6 +17,11 @@ import httpx
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_DELAYS = [1.0, 2.0, 4.0]  # Exponential backoff delays in seconds
+RETRYABLE_STATUS_CODES = {502, 503, 504}  # Gateway errors that may be transient
 
 
 class OutlineMcpClient:
@@ -98,28 +104,70 @@ class OutlineMcpClient:
             if params is not None:
                 payload["params"] = params
 
-            resp = await client.post(
-                self.endpoint,
-                content=json.dumps(payload),
-                headers=self._session_headers(),
-            )
+            last_error: Optional[Exception] = None
 
-            # Handle expired session
-            if resp.status_code in (400, 404):
-                logger.info("Outline MCP session invalid; reinitializing")
-                self._session_id = None
-                await self._initialize(client)
-                resp = await client.post(
-                    self.endpoint,
-                    content=json.dumps(payload),
-                    headers=self._session_headers(),
-                )
+            for attempt in range(MAX_RETRIES):
+                try:
+                    resp = await client.post(
+                        self.endpoint,
+                        content=json.dumps(payload),
+                        headers=self._session_headers(),
+                    )
 
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, dict) and data.get("error"):
-                return {"error": data["error"]}
-            return data.get("result", data)
+                    # Handle expired session
+                    if resp.status_code in (400, 404):
+                        logger.info("Outline MCP session invalid; reinitializing")
+                        self._session_id = None
+                        await self._initialize(client)
+                        resp = await client.post(
+                            self.endpoint,
+                            content=json.dumps(payload),
+                            headers=self._session_headers(),
+                        )
+
+                    # Retry on transient server errors
+                    if resp.status_code in RETRYABLE_STATUS_CODES:
+                        delay = RETRY_DELAYS[attempt] if attempt < len(RETRY_DELAYS) else RETRY_DELAYS[-1]
+                        logger.warning(
+                            f"Outline MCP returned {resp.status_code}, retrying in {delay}s "
+                            f"(attempt {attempt + 1}/{MAX_RETRIES})"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if isinstance(data, dict) and data.get("error"):
+                        return {"error": data["error"]}
+                    return data.get("result", data)
+
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
+                        delay = RETRY_DELAYS[attempt] if attempt < len(RETRY_DELAYS) else RETRY_DELAYS[-1]
+                        logger.warning(
+                            f"Outline MCP error {e.response.status_code}, retrying in {delay}s "
+                            f"(attempt {attempt + 1}/{MAX_RETRIES})"
+                        )
+                        await asyncio.sleep(delay)
+                        last_error = e
+                        continue
+                    raise
+                except (httpx.ConnectError, httpx.TimeoutException) as e:
+                    if attempt < MAX_RETRIES - 1:
+                        delay = RETRY_DELAYS[attempt] if attempt < len(RETRY_DELAYS) else RETRY_DELAYS[-1]
+                        logger.warning(
+                            f"Outline MCP connection error, retrying in {delay}s "
+                            f"(attempt {attempt + 1}/{MAX_RETRIES}): {e}"
+                        )
+                        await asyncio.sleep(delay)
+                        last_error = e
+                        continue
+                    raise
+
+            # If we exhausted retries, raise the last error
+            if last_error:
+                raise last_error
+            raise RuntimeError("Outline MCP request failed after max retries")
 
     async def list_tools(self) -> dict[str, Any]:
         return await self._post("tools/list")

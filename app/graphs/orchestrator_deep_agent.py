@@ -462,7 +462,7 @@ async def create_orchestrator_deep_agent(
     # =========================================================================
     # Get Tools from Registry
     # =========================================================================
-    registry = create_default_registry(user_id=auth0_id)
+    registry = await create_default_registry(user_id=auth0_id)
 
     # Use all available tools; selected_tools only influences priority guidance.
     tools = registry.get_tools()

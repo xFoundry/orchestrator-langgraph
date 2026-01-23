@@ -9,6 +9,8 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_core.callbacks.manager import adispatch_custom_event
 from langchain_openai import ChatOpenAI
 
+from app.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -84,9 +86,15 @@ async def generate_thread_title(
     
     if not first_human:
         return None
-    
+
     try:
-        llm = ChatOpenAI(model=model, temperature=0, max_tokens=50)
+        settings = get_settings()
+        llm = ChatOpenAI(
+            model=model,
+            api_key=settings.openai_api_key,
+            temperature=0,
+            max_tokens=50,
+        )
         
         # Build the prompt
         context = f"User: {first_human[:500]}"

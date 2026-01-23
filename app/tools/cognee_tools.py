@@ -22,6 +22,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
+from app.tools.sanitize import sanitize_for_json
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ async def _cognee_search(
                     r["_search_type"] = search_type
 
             logger.info(f"Cognee {search_type} search: {len(result.get('results', []))} results")
-            return result
+            return sanitize_for_json(result)
 
     except httpx.HTTPError as e:
         logger.error(f"Cognee {search_type} search failed: {e}")
@@ -235,7 +236,7 @@ async def cognee_add(
             result = response.json()
 
             logger.info(f"Cognee add completed: {result.get('status', 'unknown')}")
-            return result
+            return sanitize_for_json(result)
 
     except httpx.HTTPError as e:
         logger.error(f"Cognee add failed: {e}")

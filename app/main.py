@@ -12,7 +12,8 @@ from pythonjsonlogger import jsonlogger
 
 from app.config import get_settings
 from app.persistence.redis import get_checkpointer, close_checkpointer, get_store, close_store
-from app.api.routes import chat, chat_stream, files, threads
+from app.db import init_db
+from app.api.routes import chat, chat_stream, files, threads, integrations
 
 # Configure logging
 settings = get_settings()
@@ -62,6 +63,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.error(f"Failed to initialize LangGraph store: {e}")
         raise
 
+    # Initialize database tables for integrations
+    if settings.postgres_url:
+        try:
+            await init_db()
+            logger.info("Database tables initialized for integrations")
+        except Exception as e:
+            logger.warning(f"Failed to initialize database tables: {e}")
+
     yield
 
     # Cleanup
@@ -92,6 +101,7 @@ app.include_router(chat.router)
 app.include_router(chat_stream.router)
 app.include_router(files.router)
 app.include_router(threads.router)
+app.include_router(integrations.router)
 
 
 @app.get("/")

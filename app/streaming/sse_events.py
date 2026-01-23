@@ -19,6 +19,7 @@ class SSEEventType(str, Enum):
     THINKING = "thinking"  # For planning/reasoning steps
     TODO = "todo"  # For todo/task list updates
     ARTIFACT = "artifact"
+    THREAD_TITLE = "thread_title"  # AI-generated thread title
     COMPLETE = "complete"
     ERROR = "error"
     HEARTBEAT = "heartbeat"
@@ -115,6 +116,13 @@ class ArtifactData(BaseModel):
     payload: Any
     origin: Optional[dict[str, Any]] = None
     created_at: Optional[float] = None
+
+
+class ThreadTitleData(BaseModel):
+    """Data for thread_title events - AI-generated conversation title."""
+
+    title: str
+    thread_id: Optional[str] = None
 
 
 class CompleteData(BaseModel):

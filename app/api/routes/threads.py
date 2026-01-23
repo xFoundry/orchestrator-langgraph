@@ -298,7 +298,8 @@ async def list_threads(
 
     try:
         # Get all thread metadata for this user (use async search)
-        items = await store.asearch(namespace)
+        # Note: LangGraph store asearch defaults to limit=10, so we need to set a higher limit
+        items = await store.asearch(namespace, limit=1000)
         logger.info(f"[Threads] asearch returned {len(items)} raw items from namespace {namespace}")
 
         # Debug: log all item keys

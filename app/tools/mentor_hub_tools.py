@@ -19,6 +19,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
+from app.tools.sanitize import sanitize_for_json
 
 logger = logging.getLogger(__name__)
 
@@ -242,11 +243,11 @@ async def get_mentor_hub_sessions(
             session_info["full_transcript"] = session.get("fullTranscript")
         formatted.append(session_info)
 
-    return {
+    return sanitize_for_json({
         "sessions": formatted,
         "count": len(formatted),
         "source": "mentor_hub_live",
-    }
+    })
 
 
 @tool(args_schema=TeamInput)
@@ -466,7 +467,7 @@ async def get_mentor_hub_team(team_id: str) -> dict[str, Any]:
 
     logger.info(f"Returning team data with {len(formatted_active)} active members: {[m.get('name') for m in formatted_active]}")
 
-    return {
+    return sanitize_for_json({
         "id": team.get("id"),
         "team_id": team.get("teamId"),
         "name": team.get("teamName"),
@@ -477,7 +478,7 @@ async def get_mentor_hub_team(team_id: str) -> dict[str, Any]:
         "cohorts": extract_all(team.get("cohorts"), "shortName"),
         "recent_sessions": recent_sessions,
         "source": "mentor_hub_live",
-    }
+    })
 
 
 @tool(args_schema=MentorSearchInput)
@@ -600,11 +601,11 @@ async def search_mentor_hub_mentors(
             "cohorts": extract_cohorts(contact.get("participation")),
         })
 
-    return {
+    return sanitize_for_json({
         "mentors": formatted,
         "count": len(formatted),
         "source": "mentor_hub_live",
-    }
+    })
 
 
 @tool(args_schema=TasksInput)
@@ -735,11 +736,11 @@ async def get_mentor_hub_tasks(
             "session_type": extract_name(task.get("session"), "sessionType") if task.get("session") else None,
         })
 
-    return {
+    return sanitize_for_json({
         "tasks": formatted,
         "count": len(formatted),
         "source": "mentor_hub_live",
-    }
+    })
 
 
 @tool
@@ -836,7 +837,7 @@ async def get_mentor_hub_user_context(email: str) -> dict[str, Any]:
             })
         return result
 
-    return {
+    return sanitize_for_json({
         "id": contact.get("id"),
         "name": contact.get("fullName"),
         "email": contact.get("email"),
@@ -844,7 +845,7 @@ async def get_mentor_hub_user_context(email: str) -> dict[str, Any]:
         "teams": extract_team_names(contact.get("members")),
         "participations": extract_participations(contact.get("participation")),
         "source": "mentor_hub_live",
-    }
+    })
 
 
 # =============================================================================

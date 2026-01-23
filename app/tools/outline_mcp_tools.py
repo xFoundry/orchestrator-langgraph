@@ -14,6 +14,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from app.tools.outline_mcp_client import get_outline_mcp_client
+from app.tools.sanitize import sanitize_for_json
 
 logger = logging.getLogger(__name__)
 
@@ -22,16 +23,16 @@ def _parse_mcp_result(result: dict[str, Any]) -> dict[str, Any]:
     """Extract JSON payload from MCP content blocks when possible."""
     content = result.get("content")
     if not isinstance(content, list):
-        return result
+        return sanitize_for_json(result)
     for block in content:
         if isinstance(block, dict) and block.get("type") == "text":
             text = block.get("text")
             if isinstance(text, str):
                 try:
-                    return json.loads(text)
+                    return sanitize_for_json(json.loads(text))
                 except Exception:
-                    return {"text": text}
-    return result
+                    return sanitize_for_json({"text": text})
+    return sanitize_for_json(result)
 
 
 def _truncate(text: str, limit: int = 4000) -> str:
@@ -111,17 +112,19 @@ async def outline_documents_list(
 ) -> dict[str, Any]:
     """List documents with metadata (no full content)."""
     client = get_outline_mcp_client()
-    result = await client.call_tool(
-        "documents_list",
-        {
-            "collectionId": collection_id,
-            "userId": user_id,
-            "limit": limit,
-            "offset": offset,
-            "sort": sort,
-            "direction": direction,
-        },
-    )
+    # Build args, excluding None values (MCP server rejects null)
+    args: dict[str, Any] = {
+        "limit": limit,
+        "offset": offset,
+        "sort": sort,
+        "direction": direction,
+    }
+    if collection_id is not None:
+        args["collectionId"] = collection_id
+    if user_id is not None:
+        args["userId"] = user_id
+
+    result = await client.call_tool("documents_list", args)
     return _parse_mcp_result(result)
 
 
@@ -145,16 +148,17 @@ async def outline_documents_search(
 ) -> dict[str, Any]:
     """Search Outline documents by keyword/phrase."""
     client = get_outline_mcp_client()
-    result = await client.call_tool(
-        "documents_search",
-        {
-            "query": query,
-            "collectionId": collection_id,
-            "limit": limit,
-            "includeArchived": include_archived,
-            "includeDrafts": include_drafts,
-        },
-    )
+    # Build args, excluding None values (MCP server rejects null)
+    args: dict[str, Any] = {
+        "query": query,
+        "limit": limit,
+        "includeArchived": include_archived,
+        "includeDrafts": include_drafts,
+    }
+    if collection_id is not None:
+        args["collectionId"] = collection_id
+
+    result = await client.call_tool("documents_search", args)
     parsed = _parse_mcp_result(result)
     if isinstance(parsed, dict) and "results" in parsed:
         parsed["results"] = (parsed["results"] or [])[:limit]

@@ -14,6 +14,7 @@ from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from app.config import get_settings
+from app.tools.sanitize import sanitize_for_json
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +157,7 @@ async def firecrawl_scrape(
     result = await _firecrawl_post("/v2/scrape", payload)
     data = result.get("data") or {}
 
-    return {
+    return sanitize_for_json({
         "url": url,
         "markdown": data.get("markdown"),
         "summary": data.get("summary"),
@@ -164,7 +165,7 @@ async def firecrawl_scrape(
         "links": data.get("links"),
         "warning": data.get("warning"),
         "success": result.get("success", True),
-    }
+    })
 
 
 class FirecrawlSearchInput(BaseModel):
@@ -221,12 +222,12 @@ async def firecrawl_search(
             }
         )
 
-    return {
+    return sanitize_for_json({
         "query": query,
         "results": results,
         "count": len(results),
         "success": result.get("success", True),
-    }
+    })
 
 
 class FirecrawlMapInput(BaseModel):
@@ -276,12 +277,12 @@ async def firecrawl_map(
     data = result.get("data") or result
     urls = data.get("urls") or data.get("links") or []
 
-    return {
+    return sanitize_for_json({
         "url": url,
         "urls": urls,
         "count": len(urls) if isinstance(urls, list) else 0,
         "success": result.get("success", True),
-    }
+    })
 
 
 class FirecrawlCrawlInput(BaseModel):
@@ -330,11 +331,11 @@ async def firecrawl_crawl(
     result = await _firecrawl_post("/v2/crawl", payload)
     data = result.get("data") or result
 
-    return {
+    return sanitize_for_json({
         "url": url,
         "job": data,
         "success": result.get("success", True),
-    }
+    })
 
 
 class FirecrawlExtractInput(BaseModel):
@@ -385,8 +386,8 @@ async def firecrawl_extract(
     result = await _firecrawl_post("/v2/extract", payload)
     data = result.get("data") or result
 
-    return {
+    return sanitize_for_json({
         "urls": urls,
         "results": data,
         "success": result.get("success", True),
-    }
+    })

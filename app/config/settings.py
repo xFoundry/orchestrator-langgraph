@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     # Postgres (LangGraph Store)
     postgres_url: Optional[str] = None
 
+    # Integration encryption
+    integration_encryption_key: Optional[str] = None
+
     # Deep Agent Configuration
     deep_agent_model: Optional[str] = None  # Defaults to default_orchestrator_model
     deep_agent_enable_subagents: bool = True
