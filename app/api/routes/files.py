@@ -414,6 +414,144 @@ async def get_file_tree(
     return FileTreeResponse(tree=tree)
 
 
+class AllFilesResponse(BaseModel):
+    """Response for listing all files across threads."""
+
+    threads: list[dict] = Field(default_factory=list, description="Files grouped by thread")
+    user_files: list[FileInfo] = Field(default_factory=list, description="User-scoped files")
+    tenant_files: list[FileInfo] = Field(default_factory=list, description="Tenant-scoped files")
+    total_files: int = Field(0, description="Total file count")
+
+
+@router.get("/all", response_model=AllFilesResponse)
+async def list_all_files(
+    tenant_id: str = Query("default", description="Tenant ID"),
+    user_id: str = Query(..., description="User ID"),
+):
+    """
+    List all files for a user across all threads.
+
+    Returns files grouped by:
+    - threads: Files from each thread's artifacts folder
+    - user_files: User-scoped saved files
+    - tenant_files: Tenant-scoped shared files
+    """
+    from app.api.routes.threads import get_thread_metadata_namespace, ThreadMetadata
+
+    store = await get_store()
+    total_files = 0
+
+    # Get all threads for this user
+    thread_namespace = get_thread_metadata_namespace(tenant_id, user_id)
+    thread_items = await store.asearch(thread_namespace, limit=1000)
+
+    threads_with_files = []
+
+    for item in thread_items:
+        # Skip non-thread items
+        if not item.key.startswith("thread-"):
+            continue
+
+        if not isinstance(item.value, dict):
+            continue
+
+        # Parse thread metadata
+        try:
+            thread_meta = ThreadMetadata(**item.value)
+        except Exception:
+            continue
+
+        # Skip archived threads
+        if thread_meta.is_archived:
+            continue
+
+        # Get artifacts for this thread
+        thread_id = thread_meta.id
+        try:
+            artifacts_namespace = get_namespace_for_scope(
+                "thread_artifacts", tenant_id, user_id, thread_id
+            )
+            artifact_items = list(await store.asearch(artifacts_namespace))
+
+            files = []
+            for artifact in artifact_items:
+                # Filter to actual files
+                if not isinstance(artifact.value, dict):
+                    continue
+                if "content" not in artifact.value or "path" not in artifact.value:
+                    continue
+
+                files.append(FileInfo(
+                    key=artifact.key,
+                    path=f"/threads/{thread_id}/artifacts/{artifact.key}",
+                    size=len(artifact.value.get("content", "")),
+                    scope="thread_artifacts",
+                ))
+
+            if files:
+                threads_with_files.append({
+                    "thread_id": thread_id,
+                    "thread_title": thread_meta.title,
+                    "updated_at": thread_meta.updated_at,
+                    "files": [f.model_dump() for f in files],
+                })
+                total_files += len(files)
+
+        except Exception as e:
+            logger.warning(f"Error getting artifacts for thread {thread_id}: {e}")
+            continue
+
+    # Sort threads by updated_at (most recent first)
+    threads_with_files.sort(key=lambda t: t["updated_at"], reverse=True)
+
+    # Get user-saved files
+    user_files = []
+    try:
+        saved_namespace = get_namespace_for_scope("user_saved", tenant_id, user_id)
+        saved_items = list(await store.asearch(saved_namespace))
+        for item in saved_items:
+            if not isinstance(item.value, dict):
+                continue
+            if "content" not in item.value or "path" not in item.value:
+                continue
+            user_files.append(FileInfo(
+                key=item.key,
+                path=get_virtual_path_for_scope("user_saved", item.key),
+                size=len(item.value.get("content", "")),
+                scope="user_saved",
+            ))
+        total_files += len(user_files)
+    except Exception as e:
+        logger.warning(f"Error getting user saved files: {e}")
+
+    # Get tenant-shared files
+    tenant_files = []
+    try:
+        tenant_namespace = get_namespace_for_scope("tenant", tenant_id, user_id)
+        tenant_items = list(await store.asearch(tenant_namespace))
+        for item in tenant_items:
+            if not isinstance(item.value, dict):
+                continue
+            if "content" not in item.value or "path" not in item.value:
+                continue
+            tenant_files.append(FileInfo(
+                key=item.key,
+                path=get_virtual_path_for_scope("tenant", item.key),
+                size=len(item.value.get("content", "")),
+                scope="tenant",
+            ))
+        total_files += len(tenant_files)
+    except Exception as e:
+        logger.warning(f"Error getting tenant files: {e}")
+
+    return AllFilesResponse(
+        threads=threads_with_files,
+        user_files=user_files,
+        tenant_files=tenant_files,
+        total_files=total_files,
+    )
+
+
 @router.post("/promote", response_model=PromoteFileResponse)
 async def promote_file(
     request: PromoteFileRequest,

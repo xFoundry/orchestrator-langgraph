@@ -2,24 +2,407 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
-from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.base import (
+    BaseCheckpointSaver,
+    ChannelVersions,
+    Checkpoint,
+    CheckpointMetadata,
+    CheckpointTuple,
+    PendingWrite,
+)
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.base import BaseStore
 from langgraph.store.memory import InMemoryStore
+from langchain_core.runnables import RunnableConfig
 
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# Regex to remove control characters that crash Redis/JSON
+# Keeps: \t (tab, 0x09), \n (newline, 0x0A), \r (carriage return, 0x0D)
+# Removes: 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, 0x7F (DEL)
+import re
+CONTROL_CHAR_REGEX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
 # Global checkpointer instance and context manager
 _checkpointer: Optional[BaseCheckpointSaver] = None
 _checkpointer_cm: Optional[Any] = None
 _store: Optional[BaseStore] = None
 _store_cm: Optional[Any] = None
+
+
+class SanitizingCheckpointSaver(BaseCheckpointSaver):
+    """
+    Checkpoint saver wrapper that sanitizes data before writing to Redis.
+
+    Redis JSON module rejects unescaped control characters (\\u0000-\\u001F).
+    Data from external APIs, web scraping, or tool outputs may contain these
+    characters. This wrapper sanitizes all channel_values before checkpoint
+    writes to prevent Redis JSON errors.
+
+    This is the proper fix for errors like:
+    "Command JSON.SET caused error: ('invalid escape at line 1 column N',)"
+    """
+
+    def __init__(self, wrapped: BaseCheckpointSaver):
+        """
+        Initialize with a wrapped checkpointer.
+
+        Args:
+            wrapped: The underlying checkpointer (e.g., AsyncRedisSaver)
+        """
+        # Don't call super().__init__() as it may have required args
+        self._wrapped = wrapped
+        # Copy serde from wrapped if available
+        if hasattr(wrapped, 'serde'):
+            self.serde = wrapped.serde
+
+    @property
+    def config_specs(self):
+        """Delegate config_specs to wrapped checkpointer."""
+        return self._wrapped.config_specs
+
+    def _sanitize_value(self, value: Any, depth: int = 0) -> Any:
+        """
+        Recursively sanitize a value, removing control characters from strings.
+
+        IMPORTANT: Unlike sanitize_for_json which uses JSON round-trip with default=str,
+        this method preserves object types (like LangChain messages). It only touches
+        actual strings, leaving complex objects intact for proper serialization.
+
+        Args:
+            value: Any value to sanitize
+            depth: Current recursion depth (prevents infinite recursion)
+
+        Returns:
+            Value with control characters removed from any string content
+        """
+        # Prevent infinite recursion on circular references
+        if depth > 100:
+            return value
+
+        if value is None:
+            return None
+
+        if isinstance(value, str):
+            return CONTROL_CHAR_REGEX.sub('', value)
+
+        if isinstance(value, bytes):
+            # Bytes might contain control chars when decoded
+            try:
+                decoded = value.decode('utf-8', errors='replace')
+                return CONTROL_CHAR_REGEX.sub('', decoded).encode('utf-8')
+            except Exception:
+                return value
+
+        if isinstance(value, dict):
+            return {self._sanitize_value(k, depth + 1): self._sanitize_value(v, depth + 1)
+                    for k, v in value.items()}
+
+        if isinstance(value, list):
+            return [self._sanitize_value(item, depth + 1) for item in value]
+
+        if isinstance(value, tuple):
+            return tuple(self._sanitize_value(item, depth + 1) for item in value)
+
+        if isinstance(value, set):
+            return {self._sanitize_value(item, depth + 1) for item in value}
+
+        # For primitive types, return as-is
+        if isinstance(value, (int, float, bool, type(None))):
+            return value
+
+        # For objects with known string attributes (LangChain messages, Pydantic models, etc.)
+        # Try to sanitize any string attributes we can find
+        try:
+            # Handle objects with __dict__ (regular Python objects)
+            if hasattr(value, '__dict__'):
+                for attr_name in list(vars(value).keys()):
+                    try:
+                        attr_value = getattr(value, attr_name)
+                        if isinstance(attr_value, str):
+                            sanitized = CONTROL_CHAR_REGEX.sub('', attr_value)
+                            setattr(value, attr_name, sanitized)
+                        elif isinstance(attr_value, (dict, list, tuple)):
+                            sanitized = self._sanitize_value(attr_value, depth + 1)
+                            setattr(value, attr_name, sanitized)
+                    except (AttributeError, TypeError):
+                        # Attribute is read-only or can't be set, skip
+                        pass
+
+            # Handle Pydantic models (v1 and v2)
+            if hasattr(value, 'model_fields') or hasattr(value, '__fields__'):
+                fields = getattr(value, 'model_fields', None) or getattr(value, '__fields__', {})
+                for field_name in fields:
+                    try:
+                        field_value = getattr(value, field_name, None)
+                        if isinstance(field_value, str):
+                            sanitized = CONTROL_CHAR_REGEX.sub('', field_value)
+                            # Try direct assignment first
+                            try:
+                                setattr(value, field_name, sanitized)
+                            except Exception:
+                                # For frozen models, try __dict__ assignment
+                                if hasattr(value, '__dict__'):
+                                    value.__dict__[field_name] = sanitized
+                        elif field_value is not None:
+                            self._sanitize_value(field_value, depth + 1)
+                    except Exception:
+                        pass
+
+            # Handle dataclasses
+            if hasattr(value, '__dataclass_fields__'):
+                for field_name in value.__dataclass_fields__:
+                    try:
+                        field_value = getattr(value, field_name)
+                        if isinstance(field_value, str):
+                            sanitized = CONTROL_CHAR_REGEX.sub('', field_value)
+                            object.__setattr__(value, field_name, sanitized)
+                        elif field_value is not None:
+                            self._sanitize_value(field_value, depth + 1)
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            logger.debug(f"Could not sanitize object attributes: {e}")
+
+        return value
+
+    def _sanitize_checkpoint(self, checkpoint: Checkpoint) -> Checkpoint:
+        """
+        Sanitize checkpoint data to remove JSON-breaking control characters.
+
+        Uses recursive sanitization that preserves LangChain message objects
+        while removing control characters from string content.
+
+        Args:
+            checkpoint: The checkpoint dict to sanitize
+
+        Returns:
+            Sanitized checkpoint with control characters removed
+        """
+        if not checkpoint:
+            return checkpoint
+
+        # Create a shallow copy to avoid mutating the original
+        sanitized = dict(checkpoint)
+
+        # Sanitize channel_values - this is where tool results and messages live
+        if "channel_values" in sanitized:
+            try:
+                sanitized["channel_values"] = self._sanitize_value(sanitized["channel_values"])
+            except Exception as e:
+                logger.warning(f"Failed to sanitize channel_values: {e}")
+
+        # Also sanitize pending_sends if present
+        if "pending_sends" in sanitized:
+            try:
+                sanitized["pending_sends"] = self._sanitize_value(sanitized["pending_sends"])
+            except Exception as e:
+                logger.warning(f"Failed to sanitize pending_sends: {e}")
+
+        return sanitized
+
+    def _sanitize_metadata(self, metadata: CheckpointMetadata) -> CheckpointMetadata:
+        """
+        Sanitize checkpoint metadata to remove control characters.
+
+        Args:
+            metadata: The metadata dict to sanitize
+
+        Returns:
+            Sanitized metadata with control characters removed
+        """
+        if not metadata:
+            return metadata
+
+        return self._sanitize_value(dict(metadata))
+
+    def _aggressive_sanitize(self, value: Any) -> Any:
+        """
+        Aggressive JSON-level sanitization as a fallback.
+
+        Serializes the value to JSON (converting any non-serializable objects to strings),
+        sanitizes the resulting JSON string, and deserializes back.
+
+        This catches control characters that slip through object-level sanitization,
+        such as those in complex nested structures or custom objects.
+
+        Args:
+            value: Any value to sanitize
+
+        Returns:
+            Sanitized value with all control characters removed
+        """
+        if value is None:
+            return None
+
+        try:
+            # Serialize to JSON, converting non-serializable objects to strings
+            def default_handler(obj):
+                try:
+                    # Try to get dict representation
+                    if hasattr(obj, '__dict__'):
+                        return obj.__dict__
+                    # Try to get string representation
+                    return str(obj)
+                except Exception:
+                    return f"<{type(obj).__name__}>"
+
+            json_str = json.dumps(value, default=default_handler, ensure_ascii=False)
+
+            # Sanitize the JSON string
+            sanitized_json = CONTROL_CHAR_REGEX.sub('', json_str)
+
+            # Deserialize back
+            return json.loads(sanitized_json)
+
+        except Exception as e:
+            logger.warning(f"Aggressive sanitization failed, returning original: {e}")
+            return value
+
+    def _sanitize_writes(self, writes: Sequence[tuple[str, Any]]) -> list[tuple[str, Any]]:
+        """Sanitize pending writes data using type-preserving sanitization."""
+        sanitized_writes = []
+        for channel, value in writes:
+            try:
+                sanitized_value = self._sanitize_value(value)
+                sanitized_writes.append((channel, sanitized_value))
+            except Exception as e:
+                logger.warning(f"Failed to sanitize write for channel {channel}: {e}")
+                sanitized_writes.append((channel, value))
+        return sanitized_writes
+
+    # Delegate all read operations to wrapped checkpointer
+    def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
+        return self._wrapped.get_tuple(config)
+
+    async def aget_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
+        return await self._wrapped.aget_tuple(config)
+
+    def list(
+        self,
+        config: Optional[RunnableConfig],
+        *,
+        filter: Optional[dict[str, Any]] = None,
+        before: Optional[RunnableConfig] = None,
+        limit: Optional[int] = None,
+    ):
+        return self._wrapped.list(config, filter=filter, before=before, limit=limit)
+
+    async def alist(
+        self,
+        config: Optional[RunnableConfig],
+        *,
+        filter: Optional[dict[str, Any]] = None,
+        before: Optional[RunnableConfig] = None,
+        limit: Optional[int] = None,
+    ):
+        async for item in self._wrapped.alist(config, filter=filter, before=before, limit=limit):
+            yield item
+
+    # Write operations - sanitize before delegating
+    def put(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        sanitized_checkpoint = self._sanitize_checkpoint(checkpoint)
+        sanitized_metadata = self._sanitize_metadata(metadata)
+        try:
+            return self._wrapped.put(config, sanitized_checkpoint, sanitized_metadata, new_versions)
+        except Exception as e:
+            error_str = str(e).lower()
+            if 'control character' in error_str or 'invalid escape' in error_str:
+                logger.warning(f"Control character error in put, attempting aggressive sanitization: {e}")
+                sanitized_checkpoint = self._aggressive_sanitize(sanitized_checkpoint)
+                sanitized_metadata = self._aggressive_sanitize(sanitized_metadata)
+                return self._wrapped.put(config, sanitized_checkpoint, sanitized_metadata, new_versions)
+            raise
+
+    async def aput(
+        self,
+        config: RunnableConfig,
+        checkpoint: Checkpoint,
+        metadata: CheckpointMetadata,
+        new_versions: ChannelVersions,
+    ) -> RunnableConfig:
+        sanitized_checkpoint = self._sanitize_checkpoint(checkpoint)
+        sanitized_metadata = self._sanitize_metadata(metadata)
+        try:
+            return await self._wrapped.aput(config, sanitized_checkpoint, sanitized_metadata, new_versions)
+        except Exception as e:
+            error_str = str(e).lower()
+            if 'control character' in error_str or 'invalid escape' in error_str:
+                # First sanitization wasn't enough - do aggressive JSON-level sanitization
+                logger.warning(f"Control character error in aput, attempting aggressive sanitization: {e}")
+                sanitized_checkpoint = self._aggressive_sanitize(sanitized_checkpoint)
+                sanitized_metadata = self._aggressive_sanitize(sanitized_metadata)
+                return await self._wrapped.aput(config, sanitized_checkpoint, sanitized_metadata, new_versions)
+            raise
+
+    def put_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        sanitized_writes = self._sanitize_writes(writes)
+        try:
+            return self._wrapped.put_writes(config, sanitized_writes, task_id, task_path)
+        except Exception as e:
+            error_str = str(e).lower()
+            if 'control character' in error_str or 'invalid escape' in error_str:
+                logger.warning(f"Control character error in put_writes, attempting aggressive sanitization: {e}")
+                sanitized_writes = [(ch, self._aggressive_sanitize(v)) for ch, v in sanitized_writes]
+                return self._wrapped.put_writes(config, sanitized_writes, task_id, task_path)
+            raise
+
+    async def aput_writes(
+        self,
+        config: RunnableConfig,
+        writes: Sequence[tuple[str, Any]],
+        task_id: str,
+        task_path: str = "",
+    ) -> None:
+        sanitized_writes = self._sanitize_writes(writes)
+        try:
+            return await self._wrapped.aput_writes(config, sanitized_writes, task_id, task_path)
+        except Exception as e:
+            error_str = str(e).lower()
+            if 'control character' in error_str or 'invalid escape' in error_str:
+                logger.warning(f"Control character error in aput_writes, attempting aggressive sanitization: {e}")
+                sanitized_writes = [(ch, self._aggressive_sanitize(v)) for ch, v in sanitized_writes]
+                return await self._wrapped.aput_writes(config, sanitized_writes, task_id, task_path)
+            raise
+
+    # Delegate setup method if available
+    async def asetup(self) -> None:
+        if hasattr(self._wrapped, 'asetup'):
+            await self._wrapped.asetup()
+
+    def setup(self) -> None:
+        if hasattr(self._wrapped, 'setup'):
+            self._wrapped.setup()
+
+    # Delegate version methods required by LangGraph
+    def get_next_version(self, current: Optional[str], channel: ChannelVersions) -> str:
+        """Delegate version generation to wrapped checkpointer."""
+        return self._wrapped.get_next_version(current, channel)
+
+    # Delegate any other attributes/methods to wrapped checkpointer
+    def __getattr__(self, name: str) -> Any:
+        """Fallback: delegate any unknown attributes to the wrapped checkpointer."""
+        return getattr(self._wrapped, name)
 
 
 async def get_checkpointer() -> BaseCheckpointSaver:
@@ -52,9 +435,13 @@ async def get_checkpointer() -> BaseCheckpointSaver:
 
         # from_conn_string returns an async context manager
         _checkpointer_cm = AsyncRedisSaver.from_conn_string(settings.redis_url)
-        _checkpointer = await _checkpointer_cm.__aenter__()
+        redis_saver = await _checkpointer_cm.__aenter__()
 
-        logger.info("Redis Stack checkpointer initialized successfully")
+        # Wrap with sanitizing layer to prevent JSON control character errors
+        # This fixes: "Command JSON.SET caused error: ('invalid escape at line N column M',)"
+        _checkpointer = SanitizingCheckpointSaver(redis_saver)
+
+        logger.info("Redis Stack checkpointer initialized with sanitization layer")
         return _checkpointer
 
     except Exception as e:

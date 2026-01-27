@@ -27,6 +27,7 @@ from langgraph.store.base import BaseStore
 
 from app.config import get_settings, Settings
 from app.tools.tool_registry import create_default_registry
+from app.tools.error_handling import wrap_tools_with_error_handling
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +170,12 @@ For external information:
 For missing or ambiguous details:
 - `request_clarifications`: Ask multiple-choice questions with an "other" option
 
+### External Integrations (via integration-agent)
+For project management and collaboration tools (Wrike, Linear, GitHub, Slack):
+- Delegate to `integration-agent` using the `task` tool
+- The integration-agent handles: creating/updating tasks, fetching project status, managing workflows
+- Example: `task(agent="integration-agent", task="Create a Wrike task for...")`
+
 ## Guidelines
 
 1. **Choose the right tools**:
@@ -176,6 +183,7 @@ For missing or ambiguous details:
    - For historical context, relationships, program info: Use Cognee knowledge graph tools
    - For internal documentation/policies: Use Outline tools
    - For external research: Use Firecrawl web tools
+   - For external integrations (Wrike, Linear, GitHub, Slack): Delegate to `integration-agent`
 
 2. **Plan before acting**: For any task that requires multiple tool calls or multi-step work,
    use `write_todos` first. Update the todo list as you complete steps.
@@ -249,6 +257,8 @@ def get_subagent_configs(
 
     research_tools = registry.get_tools("cognee")
     if research_tools:
+        # Wrap tools with error handling for sanitization and error recovery
+        wrapped_research_tools = wrap_tools_with_error_handling(research_tools)
         subagents.append(
             {
                 "name": "research-agent",
@@ -276,12 +286,13 @@ Output format:
 - Sources used
 
 Keep your response under 500 words to maintain clean context for the main agent.""",
-                "tools": research_tools,
+                "tools": wrapped_research_tools,
             }
         )
 
     web_research_tools = registry.get_tools("firecrawl")
     if web_research_tools:
+        wrapped_web_tools = wrap_tools_with_error_handling(web_research_tools)
         subagents.append(
             {
                 "name": "web-researcher",
@@ -308,12 +319,13 @@ Output format:
 - Source URLs
 
 Keep your response focused and cite all sources.""",
-                "tools": web_research_tools,
+                "tools": wrapped_web_tools,
             }
         )
 
     mentor_tools = registry.get_tools("mentor_hub", "cognee")
     if mentor_tools:
+        wrapped_mentor_tools = wrap_tools_with_error_handling(mentor_tools)
         subagents.append(
             {
                 "name": "mentor-matcher",
@@ -339,7 +351,51 @@ Output format:
 - Any caveats or considerations
 
 Be specific about why each mentor is a good match.""",
-                "tools": mentor_tools,
+                "tools": wrapped_mentor_tools,
+            }
+        )
+
+    # Integration tools (Wrike, Linear, GitHub, Slack, etc.)
+    # These have complex MCP schemas that can cause issues with SubAgentMiddleware
+    # so they're isolated in their own subagent
+    integration_tools = registry.get_supervisor_only_tools()
+    if integration_tools:
+        # Build tool names for the prompt
+        tool_names = [getattr(t, "name", str(t)) for t in integration_tools]
+        tool_list = ", ".join(tool_names[:10])  # First 10 for brevity
+        if len(tool_names) > 10:
+            tool_list += f", ... ({len(tool_names)} total)"
+
+        subagents.append(
+            {
+                "name": "integration-agent",
+                "description": (
+                    "Use for interacting with external project management and collaboration tools "
+                    "like Wrike, Linear, GitHub, or Slack. Good for creating/updating tasks, "
+                    "fetching project status, managing workflows, and syncing data across platforms."
+                ),
+                "system_prompt": f"""You are an integration specialist for external tools. Your job is to:
+
+1. Interact with project management tools (Wrike, Linear, etc.)
+2. Create, update, and query tasks and projects
+3. Fetch status updates and reports
+4. Manage workflows across integrated platforms
+
+Available tools: {tool_list}
+
+Guidelines:
+- Use the appropriate tool for each integration
+- Handle rate limits gracefully (retry with backoff if needed)
+- For Wrike: Avoid parallel task mutations, call sequentially
+- Return structured summaries of actions taken
+
+Output format:
+- Action taken (created/updated/fetched)
+- Relevant IDs and links
+- Summary of results or status
+
+Keep responses focused on the specific integration task.""",
+                "tools": integration_tools,
             }
         )
 
@@ -460,16 +516,26 @@ async def create_orchestrator_deep_agent(
         )
 
     # =========================================================================
-    # Get Tools from Registry
+    # Get Tools from Registry (Scoped for Architecture)
     # =========================================================================
     registry = await create_default_registry(user_id=auth0_id)
 
-    # Use all available tools; selected_tools only influences priority guidance.
-    tools = registry.get_tools()
+    # Get subagent-safe tools (excludes supervisor-only tools like MCP integrations)
+    # This prevents SubAgentMiddleware from inspecting complex schemas that cause recursion
+    raw_subagent_safe_tools = registry.get_subagent_safe_tools()
+
+    # Wrap tools with error handling for sanitization and error recovery
+    # This ensures tool outputs are sanitized before entering LangGraph state (for Redis checkpoints)
+    subagent_safe_tools = wrap_tools_with_error_handling(raw_subagent_safe_tools)
+
+    # Get supervisor-only tools (complex MCP integrations like Wrike)
+    # These are already wrapped with error handling in integration_mcp_tools.py
+    supervisor_only_tools = registry.get_supervisor_only_tools()
+
     if selected_tools:
         logger.info(f"Preferred tool groups: {selected_tools}")
 
-    logger.info(f"Loaded {len(tools)} tools")
+    logger.info(f"Loaded {len(subagent_safe_tools)} subagent-safe tools, {len(supervisor_only_tools)} supervisor-only tools")
 
     # =========================================================================
     # Configure Backend (Ephemeral + Persistent)
@@ -573,7 +639,7 @@ async def create_orchestrator_deep_agent(
         agent_kwargs = {
             "model": model,
             "system_prompt": system_prompt,
-            "tools": tools,
+            "tools": subagent_safe_tools,  # Only safe tools - integrations go to dedicated subagent
             "subagents": subagents,
             "checkpointer": checkpointer,
             "name": "mentor-hub-agent",
@@ -592,7 +658,7 @@ async def create_orchestrator_deep_agent(
         agent = create_deep_agent(**agent_kwargs)
 
         logger.info(
-            f"Created Deep Agent with {len(tools)} tools and {len(subagents)} subagents"
+            f"Created Deep Agent with {len(subagent_safe_tools)} tools and {len(subagents)} subagents"
         )
 
         return agent

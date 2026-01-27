@@ -25,6 +25,7 @@ class ToolGroup:
     tools: list[BaseTool | Callable]
     description: str
     enabled_by_default: bool = True
+    supervisor_only: bool = False  # If True, only bind to supervisor, not subagents
 
 
 class ToolRegistry:
@@ -58,6 +59,7 @@ class ToolRegistry:
         self,
         *group_names: str,
         include_defaults: bool = True,
+        include_supervisor_only: bool = True,
     ) -> list[BaseTool | Callable]:
         """
         Get tools by group names.
@@ -65,6 +67,7 @@ class ToolRegistry:
         Args:
             *group_names: Specific groups to include. If empty, includes all enabled groups.
             include_defaults: Whether to include groups enabled by default when no names specified.
+            include_supervisor_only: Whether to include supervisor-only tools. Set False for subagents.
 
         Returns:
             List of tools from the specified or enabled groups.
@@ -78,8 +81,33 @@ class ToolRegistry:
             # If no specific groups, respect enabled_by_default
             if not group_names and not group.enabled_by_default and include_defaults:
                 continue
+            # Skip supervisor-only groups if not requested
+            if not include_supervisor_only and group.supervisor_only:
+                continue
             tools.extend(group.tools)
 
+        return tools
+
+    def get_subagent_safe_tools(self) -> list[BaseTool | Callable]:
+        """
+        Get tools safe for subagents (excludes supervisor-only tools).
+
+        Supervisor-only tools (like complex MCP integrations) can cause issues
+        with SubAgentMiddleware schema inspection. Use this for subagent tool lists.
+        """
+        return self.get_tools(include_supervisor_only=False)
+
+    def get_supervisor_only_tools(self) -> list[BaseTool | Callable]:
+        """
+        Get tools that should only be bound to the supervisor.
+
+        These are tools with complex schemas (like MCP integrations) that can
+        cause recursion issues in SubAgentMiddleware.
+        """
+        tools: list[BaseTool | Callable] = []
+        for group in self._groups.values():
+            if group.supervisor_only:
+                tools.extend(group.tools)
         return tools
 
     def get_group(self, name: str) -> Optional[ToolGroup]:
@@ -278,9 +306,10 @@ async def create_default_registry(user_id: Optional[str] = None) -> ToolRegistry
                         tools=integration_tools,
                         description="User-configured integrations (Wrike, Linear, GitHub, Slack, etc.). "
                         "Tools are loaded from MCP servers based on user's enabled integrations.",
+                        supervisor_only=True,  # Complex MCP schemas can crash SubAgentMiddleware
                     )
                 )
-                logger.info(f"Registered {len(integration_tools)} user integration tools")
+                logger.info(f"Registered {len(integration_tools)} user integration tools (supervisor-only)")
         except ImportError as e:
             logger.warning(f"Could not import integration MCP tools: {e}")
         except Exception as e:

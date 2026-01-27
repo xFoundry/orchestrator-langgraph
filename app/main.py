@@ -6,7 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-from fastapi import FastAPI
+from fastapi import APIRouter, Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pythonjsonlogger import jsonlogger
 
@@ -14,6 +14,7 @@ from app.config import get_settings
 from app.persistence.redis import get_checkpointer, close_checkpointer, get_store, close_store
 from app.db import init_db
 from app.api.routes import chat, chat_stream, files, threads, integrations
+from app.api.dependencies import verify_api_key
 
 # Configure logging
 settings = get_settings()
@@ -87,21 +88,25 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add CORS middleware
+# Add CORS middleware - SECURITY: Restrict methods and headers
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-API-Key", "Accept"],
 )
 
-# Include routers
-app.include_router(chat.router)
-app.include_router(chat_stream.router)
-app.include_router(files.router)
-app.include_router(threads.router)
-app.include_router(integrations.router)
+# Create protected API router with API key dependency
+# Health check endpoints remain unprotected for Kubernetes/Railway probes
+protected_router = APIRouter(dependencies=[Depends(verify_api_key)])
+protected_router.include_router(chat.router)
+protected_router.include_router(chat_stream.router)
+protected_router.include_router(files.router)
+protected_router.include_router(threads.router)
+protected_router.include_router(integrations.router)
+
+app.include_router(protected_router)
 
 
 @app.get("/")

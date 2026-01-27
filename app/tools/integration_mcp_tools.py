@@ -17,6 +17,7 @@ from typing import Any
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
+from app.tools.error_handling import wrap_tools_with_error_handling
 from app.tools.sanitize import SanitizationInterceptor
 
 logger = logging.getLogger(__name__)
@@ -317,7 +318,11 @@ async def get_user_integration_tools(user_id: str) -> list[BaseTool]:
                 logger.info(
                     f"Total MCP tools loaded for user {user_id}: {len(all_tools)}"
                 )
-                return all_tools
+                # Wrap tools with error handling so exceptions become tool results
+                # instead of killing the stream. This allows the LLM to see errors
+                # and potentially retry with a different approach.
+                wrapped_tools = wrap_tools_with_error_handling(all_tools)
+                return wrapped_tools
 
             finally:
                 await db.close()

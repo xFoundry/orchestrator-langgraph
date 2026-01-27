@@ -82,6 +82,12 @@ class LangGraphEventMapper:
         self._active_tools: set[str] = set()  # Track tools currently running
         self._handoff_summary: Optional[str] = None
         self._handoff_recent_messages: Optional[list[dict[str, Any]]] = None
+        # Accumulate thinking content per-agent to emit as single event (not per-chunk)
+        # Dict maps agent name -> accumulated thinking content
+        self._accumulated_thinking: dict[str, str] = {}
+        # Accumulate UI events for persistence (so they can be restored when loading thread)
+        # These are stored alongside the thread and used to reconstruct the UI on reload
+        self._ui_events: list[dict[str, Any]] = []
 
     def map_event(self, event: dict[str, Any]) -> list[SSEEvent]:
         """
@@ -96,12 +102,10 @@ class LangGraphEventMapper:
         sse_events: list[SSEEvent] = []
         kind = event.get("event")
         timestamp = time.time()
-
-        # Track current agent from metadata, mapping internal names to user-friendly ones
         metadata = event.get("metadata", {})
-        node_name = metadata.get("langgraph_node", "orchestrator")
-        if node_name:
-            self._current_agent = self._map_agent_name(node_name)
+
+        # Determine current agent from event metadata (stateless, robust)
+        self._current_agent = self._get_agent_name(event)
 
         if kind == "on_chat_model_stream":
             # Token streaming from LLM
@@ -111,18 +115,79 @@ class LangGraphEventMapper:
 
                 # Handle content as either string or list of content blocks
                 # GPT-5.x and deepagents return list format: [{'type': 'text', 'text': '...', 'index': 0}]
+                # Claude extended thinking: [{'type': 'thinking', 'thinking': '...'}]
+                # GPT reasoning: [{'type': 'reasoning', 'summary': [...]}] or reasoning_content attribute
                 content = ""
+                thinking_content = ""
                 if isinstance(raw_content, str):
                     content = raw_content
                 elif isinstance(raw_content, list):
-                    # Extract text from content blocks
+                    # Extract text, thinking, and reasoning from content blocks
                     for block in raw_content:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            text = block.get("text", "")
-                            if text:
-                                content += text
+                        if isinstance(block, dict):
+                            block_type = block.get("type", "")
+                            if block_type == "text":
+                                text = block.get("text", "")
+                                if text:
+                                    content += text
+                            elif block_type == "thinking":
+                                # Claude extended thinking
+                                thinking = block.get("thinking", "")
+                                if thinking:
+                                    thinking_content += thinking
+                            elif block_type == "reasoning":
+                                # GPT-5.x reasoning blocks - may have summary array
+                                summary = block.get("summary", [])
+                                if isinstance(summary, list):
+                                    for item in summary:
+                                        if isinstance(item, dict) and item.get("type") == "summary_text":
+                                            thinking_content += item.get("text", "")
+                                elif isinstance(summary, str):
+                                    thinking_content += summary
+
+                # Check for reasoning_content on chunk object (GPT/OpenAI format)
+                if hasattr(chunk, "reasoning_content") and chunk.reasoning_content:
+                    thinking_content += str(chunk.reasoning_content)
+
+                # Check additional_kwargs for reasoning (alternative format)
+                if hasattr(chunk, "additional_kwargs"):
+                    additional = chunk.additional_kwargs or {}
+                    if "reasoning_content" in additional:
+                        thinking_content += str(additional["reasoning_content"])
+                    # OpenRouter reasoning_details format
+                    if "reasoning_details" in additional:
+                        details = additional["reasoning_details"]
+                        if isinstance(details, dict) and "content" in details:
+                            thinking_content += str(details["content"])
+                        elif isinstance(details, str):
+                            thinking_content += details
+
+                # Accumulate thinking content per-agent (don't emit per-chunk to avoid UI spam)
+                # Will emit when response text starts or at stream end
+                if thinking_content:
+                    agent = self._current_agent
+                    if agent not in self._accumulated_thinking:
+                        self._accumulated_thinking[agent] = ""
+                    self._accumulated_thinking[agent] += thinking_content
 
                 if content:
+                    # Text content means response has started - emit accumulated thinking first
+                    # Emit thinking for the current agent if any
+                    agent = self._current_agent
+                    if agent in self._accumulated_thinking and self._accumulated_thinking[agent]:
+                        sse_events.append(
+                            SSEEvent(
+                                event=SSEEventType.THINKING,
+                                data=ThinkingData(
+                                    phase="reasoning",
+                                    content=self._accumulated_thinking[agent],
+                                    agent=agent,
+                                    timestamp=timestamp,
+                                ),
+                            )
+                        )
+                        # Reset after emitting
+                        self._accumulated_thinking[agent] = ""
                     tags = set(event.get("tags") or [])
                     tags.update(metadata.get("tags") or [])
                     purpose = metadata.get("purpose")
@@ -198,7 +263,18 @@ class LangGraphEventMapper:
             tool_name = event.get("name", "unknown")
             output = event.get("data", {}).get("output")
 
-            result_summary = self._summarize_tool_result(tool_name, output)
+            # Check if the tool returned an error
+            tool_success = True
+            if isinstance(output, dict) and output.get("error"):
+                tool_success = False
+                # Include suggestion in summary for better error display
+                error_msg = output.get("error_message", "Unknown error")
+                suggestion = output.get("suggestion", "")
+                result_summary = f"Error: {error_msg}"
+                if suggestion:
+                    result_summary += f" ({suggestion})"
+            else:
+                result_summary = self._summarize_tool_result(tool_name, output)
 
             sse_events.append(
                 SSEEvent(
@@ -207,7 +283,7 @@ class LangGraphEventMapper:
                         agent=self._current_agent,
                         tool_name=tool_name,
                         result_summary=result_summary,
-                        success=True,
+                        success=tool_success,
                     ),
                 )
             )
@@ -302,6 +378,30 @@ class LangGraphEventMapper:
                                 data=ThreadTitleData(title=title),
                             )
                         )
+                elif ui_name == "thinking":
+                    # Thinking/reasoning content from middleware
+                    content = ui_props.get("content", "")
+                    phase = ui_props.get("phase", "reasoning")
+                    if content:
+                        sse_events.append(
+                            SSEEvent(
+                                event=SSEEventType.THINKING,
+                                data=ThinkingData(
+                                    phase=phase,
+                                    content=content,
+                                    agent=self._current_agent,
+                                    timestamp=timestamp,
+                                ),
+                            )
+                        )
+                        # Also add to trace
+                        activity = AgentActivityData(
+                            agent=self._current_agent,
+                            action="thinking",
+                            details=f"[{phase.upper()}] {content[:100]}...",
+                            timestamp=timestamp,
+                        )
+                        self.agent_trace.append(activity)
 
         elif kind == "on_chain_start":
             # Subgraph/chain invocation - only show meaningful delegations
@@ -635,6 +735,69 @@ class LangGraphEventMapper:
 
         return new_citations
 
+    def capture_ui_event(self, event: SSEEvent) -> None:
+        """
+        Capture a UI event for persistence.
+
+        These events are stored alongside the thread so the UI can be
+        reconstructed when loading historical conversations.
+
+        Only captures events that contain meaningful UI state:
+        - agent_activity: Tool calls and agent actions
+        - tool_result: Tool results with summaries
+        - thinking: Reasoning/planning content
+        - artifact: Created artifacts
+        """
+        # Only persist events that help reconstruct the UI
+        persistable_types = {
+            SSEEventType.AGENT_ACTIVITY,
+            SSEEventType.TOOL_RESULT,
+            SSEEventType.THINKING,
+            SSEEventType.ARTIFACT,
+            SSEEventType.TODO,
+        }
+
+        if event.event in persistable_types:
+            # Store as serializable dict
+            event_dict = {
+                "type": event.event.value if hasattr(event.event, 'value') else str(event.event),
+                "data": event.data.model_dump() if hasattr(event.data, 'model_dump') else event.data,
+                "timestamp": time.time(),
+            }
+            self._ui_events.append(event_dict)
+
+    def get_ui_events(self) -> list[dict[str, Any]]:
+        """Get accumulated UI events for persistence."""
+        return self._ui_events
+
+    def flush_pending_events(self) -> list[SSEEvent]:
+        """Flush any pending accumulated events (e.g., thinking content).
+
+        Call this before create_complete_event to ensure all content is emitted.
+        """
+        events: list[SSEEvent] = []
+        timestamp = time.time()
+
+        # Emit any remaining accumulated thinking for all agents
+        for agent, thinking in list(self._accumulated_thinking.items()):
+            if thinking:
+                event = SSEEvent(
+                    event=SSEEventType.THINKING,
+                    data=ThinkingData(
+                        phase="reasoning",
+                        content=thinking,
+                        agent=agent,
+                        timestamp=timestamp,
+                    ),
+                )
+                events.append(event)
+                # Also capture for persistence
+                self.capture_ui_event(event)
+        # Clear all accumulated thinking
+        self._accumulated_thinking = {}
+
+        return events
+
     def create_complete_event(self, thread_id: Optional[str] = None) -> SSEEvent:
         """Create the final complete event with accumulated data."""
         return SSEEvent(
@@ -729,6 +892,24 @@ class LangGraphEventMapper:
             "synthesizer": "Synthesizing final answer from research...",
         }
         return descriptions.get(node_name, f"Running {node_name}...")
+
+    def _get_agent_name(self, event: dict[str, Any]) -> str:
+        """
+        Determine the agent name from event metadata.
+
+        This is a stateless approach - we look at the langgraph_node in the
+        event metadata to determine which agent emitted the event. This is
+        more robust than tracking start/end states.
+
+        Subclasses can override this to customize agent name resolution.
+        """
+        metadata = event.get("metadata", {})
+        node_name = metadata.get("langgraph_node", "")
+        agent_name = metadata.get("lc_agent_name", "")
+
+        # Prefer lc_agent_name if set, otherwise use node_name
+        name_to_map = agent_name or node_name or "orchestrator"
+        return self._map_agent_name(name_to_map)
 
     def _map_agent_name(self, node_name: str) -> str:
         """Map internal LangGraph node names to user-friendly agent names."""

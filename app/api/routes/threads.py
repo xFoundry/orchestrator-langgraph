@@ -93,6 +93,7 @@ class ThreadMessagesResponse(BaseModel):
 
     thread_id: str
     messages: list[ThreadMessage] = Field(default_factory=list)
+    ui_events: list[dict[str, Any]] = Field(default_factory=list, description="UI events for reconstructing the interface")
 
 
 # =============================================================================
@@ -523,9 +524,22 @@ async def get_thread_messages(
                 name=tool_name,
             ))
 
+        # Fetch stored UI events for this thread
+        ui_events: list[dict[str, Any]] = []
+        try:
+            store = await get_store()
+            ui_namespace = (tenant_id, "users", user_id, "thread_ui_events")
+            ui_result = await store.aget(ui_namespace, thread_id)
+            if ui_result and ui_result.value:
+                ui_events = ui_result.value.get("events", [])
+                logger.debug(f"Found {len(ui_events)} UI events for thread {thread_id}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch UI events: {e}")
+
         return ThreadMessagesResponse(
             thread_id=thread_id,
             messages=messages,
+            ui_events=ui_events,
         )
 
     except Exception as e:

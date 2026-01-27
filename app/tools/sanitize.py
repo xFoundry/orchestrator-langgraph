@@ -25,12 +25,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Regex to remove control characters that crash Redis/JSON
+# Keeps: \t (tab, 0x09), \n (newline, 0x0A), \r (carriage return, 0x0D)
+# Removes: 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, 0x7F (DEL)
+CONTROL_CHAR_REGEX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
 
 def sanitize_for_json(value: Any) -> Any:
     """
     Remove control characters from text that would break JSON serialization.
 
-    Recursively sanitizes strings, dicts, and lists. Safe to call on any value.
+    For dicts and lists, uses JSON round-trip (dumps -> scrub -> loads) to ensure
+    all nested structures are properly sanitized. This catches control characters
+    anywhere in deeply nested data from external APIs like Wrike.
 
     Args:
         value: Any value (string, dict, list, or other)
@@ -40,17 +47,25 @@ def sanitize_for_json(value: Any) -> Any:
     """
     if value is None:
         return None
+
     if isinstance(value, str):
-        # Remove control characters except:
-        # - \\t (tab, \\x09)
-        # - \\n (newline, \\x0a)
-        # - \\r (carriage return, \\x0d)
-        # These are valid in JSON when properly escaped
-        return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', value)
-    if isinstance(value, dict):
-        return {k: sanitize_for_json(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [sanitize_for_json(item) for item in value]
+        return CONTROL_CHAR_REGEX.sub('', value)
+
+    if isinstance(value, (dict, list)):
+        # JSON round-trip: dumps -> scrub -> loads
+        # This recursively sanitizes all nested strings and ensures JSON compatibility
+        try:
+            json_str = json.dumps(value, default=str)  # default=str handles non-serializable types
+            clean_str = CONTROL_CHAR_REGEX.sub('', json_str)
+            return json.loads(clean_str)
+        except Exception as e:
+            logger.warning(f"JSON round-trip sanitization failed: {e}, falling back to recursive")
+            # Fallback to recursive approach if JSON round-trip fails
+            if isinstance(value, dict):
+                return {k: sanitize_for_json(v) for k, v in value.items()}
+            return [sanitize_for_json(item) for item in value]
+
+    # For other types (int, float, bool, etc.), return as-is
     return value
 
 

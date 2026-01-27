@@ -64,7 +64,7 @@ INTEGRATION_TYPES: dict[str, IntegrationType] = {
     "linear": {
         "name": "Linear",
         "description": "Issue tracking and project management",
-        "icon": "⚡",
+        "icon": "/linear.svg",
         "category": "project-management",
         "coming_soon": True,
         "config_fields": [
@@ -85,7 +85,7 @@ INTEGRATION_TYPES: dict[str, IntegrationType] = {
     "granola": {
         "name": "Granola",
         "description": "Meeting notes and transcription",
-        "icon": "📝",
+        "icon": "/granola.svg",
         "category": "communication",
         "coming_soon": True,
         "config_fields": [
@@ -106,7 +106,7 @@ INTEGRATION_TYPES: dict[str, IntegrationType] = {
     "github": {
         "name": "GitHub",
         "description": "Code hosting and version control",
-        "icon": "🐙",
+        "icon": "/github.svg",
         "category": "project-management",
         "coming_soon": True,
         "config_fields": [
@@ -124,7 +124,7 @@ INTEGRATION_TYPES: dict[str, IntegrationType] = {
     "notion": {
         "name": "Notion",
         "description": "Collaborative workspace and notes",
-        "icon": "📓",
+        "icon": "/notion.svg",
         "category": "communication",
         "coming_soon": True,
         "config_fields": [
@@ -145,7 +145,7 @@ INTEGRATION_TYPES: dict[str, IntegrationType] = {
     "slack": {
         "name": "Slack",
         "description": "Team communication and collaboration",
-        "icon": "💬",
+        "icon": "/slack.svg",
         "category": "communication",
         "coming_soon": True,
         "config_fields": [

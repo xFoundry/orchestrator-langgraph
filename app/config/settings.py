@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     port: int = 8000
     log_level: str = "INFO"
 
+    # API Security
+    api_key: Optional[str] = None  # Set to enable API key authentication
+
     # CORS
     cors_origins: str = "http://localhost:3000,http://localhost:8000"
 

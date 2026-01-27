@@ -49,6 +49,7 @@ class DeepAgentEventMapper(LangGraphEventMapper):
         "glob",
         "grep",
         "task",
+        "subagent",  # deepagents library uses this name for task delegation
     }
 
     # Internal paths to filter (don't show to user)
@@ -61,9 +62,32 @@ class DeepAgentEventMapper(LangGraphEventMapper):
     def __init__(self) -> None:
         super().__init__()
         self._current_todos: list[dict] = []
-        self._active_subagents: set[str] = set()
+        self._active_subagents: list[str] = []  # Stack for nested subagent tracking
         self._artifact_writes: dict[str, dict[str, str]] = {}
         self._artifact_write_queue: list[dict[str, str]] = []
+        self._event_sequence: int = 0  # Track event order for debugging
+
+    def _log_sse_events(self, events: list[SSEEvent]) -> list[SSEEvent]:
+        """Log SSE events being emitted for sequence debugging."""
+        seq = self._event_sequence
+        for sse in events:
+            event_type = sse.event.value if hasattr(sse.event, 'value') else str(sse.event)
+            if event_type == "text_chunk":
+                data = sse.data
+                chunk_preview = ""
+                if hasattr(data, 'chunk'):
+                    chunk_preview = data.chunk[:50].replace("\n", " ") if data.chunk else ""
+                agent = getattr(data, 'agent', '?')
+                logger.info(f"[SSE-OUT:{seq:04d}] {event_type} agent={agent} chunk=\"{chunk_preview}...\"")
+            elif event_type == "agent_activity":
+                data = sse.data
+                action = getattr(data, 'action', '?')
+                agent = getattr(data, 'agent', '?')
+                tool = getattr(data, 'tool_name', '')
+                logger.info(f"[SSE-OUT:{seq:04d}] {event_type} action={action} agent={agent} tool={tool}")
+            else:
+                logger.debug(f"[SSE-OUT:{seq:04d}] {event_type}")
+        return events
 
     def map_event(self, event: dict[str, Any]) -> list[SSEEvent]:
         """
@@ -76,15 +100,28 @@ class DeepAgentEventMapper(LangGraphEventMapper):
         kind = event.get("event")
         timestamp = time.time()
 
-        # Track current agent from metadata
-        metadata = event.get("metadata", {})
-        node_name = metadata.get("langgraph_node", "")
-        agent_name = metadata.get("lc_agent_name", "")
+        # Always update current agent from event metadata (stateless approach)
+        # This ensures correct attribution even when we handle events directly
+        self._current_agent = self._get_agent_name(event)
 
-        if agent_name:
-            self._current_agent = agent_name
-        elif node_name:
-            self._current_agent = self._map_agent_name(node_name)
+        # Log incoming LangGraph event for sequence debugging
+        self._event_sequence += 1
+        seq = self._event_sequence
+        if kind in ("on_tool_start", "on_tool_end"):
+            tool_name = event.get("name", "?")
+            logger.info(f"[SEQ:{seq:04d}] {kind} tool={tool_name} agent={self._current_agent}")
+        elif kind == "on_chat_model_stream":
+            chunk = event.get("data", {}).get("chunk")
+            content_preview = ""
+            if chunk and hasattr(chunk, "content"):
+                raw = chunk.content
+                if isinstance(raw, str):
+                    content_preview = raw[:50].replace("\n", " ")
+                elif isinstance(raw, list) and raw:
+                    content_preview = str(raw[0])[:50]
+            logger.info(f"[SEQ:{seq:04d}] {kind} agent={self._current_agent} preview=\"{content_preview}...\"")
+        else:
+            logger.debug(f"[SEQ:{seq:04d}] {kind} agent={self._current_agent}")
 
         # =====================================================================
         # HANDLE TOOL STARTS
@@ -169,14 +206,30 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                 return sse_events
 
             # -----------------------------------------------------------------
-            # task: Emit subagent delegation event
+            # task/subagent: Emit subagent delegation event and track subagent context
+            # deepagents library uses "subagent" tool name, Claude Code uses "task"
             # -----------------------------------------------------------------
-            if tool_name == "task":
-                subagent_name = tool_input.get("agent") or tool_input.get("name", "subagent")
+            if tool_name in ("task", "subagent"):
+                # Try multiple fields to get the subagent name
+                subagent_name = (
+                    tool_input.get("agent") or
+                    tool_input.get("name") or
+                    tool_input.get("subagent_type") or
+                    tool_input.get("agent_type") or
+                    tool_input.get("type") or
+                    tool_input.get("description", "")[:50].split()[0] if tool_input.get("description") else None
+                )
+
+                # If still no name, try to infer from task description
                 task_description = tool_input.get("task") or tool_input.get("prompt", "")
+                if not subagent_name or subagent_name == "subagent":
+                    subagent_name = self._infer_subagent_name(task_description, tool_input)
 
-                self._active_subagents.add(subagent_name)
+                # Final fallback
+                if not subagent_name:
+                    subagent_name = "assistant"
 
+                # Emit delegation event BEFORE switching context
                 # Truncate task description for display
                 display_task = task_description[:100]
                 if len(task_description) > 100:
@@ -194,7 +247,14 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                         ),
                     )
                 )
-                return sse_events
+
+                # Now switch to subagent context - all subsequent tool calls
+                # will be attributed to this subagent until task completes
+                self._active_subagents.append(subagent_name)
+                self._current_agent = subagent_name
+
+                logger.info(f"[SSE-OUT:{self._event_sequence:04d}] >>> DELEGATE to {subagent_name}")
+                return self._log_sse_events(sse_events)
 
             # -----------------------------------------------------------------
             # Filesystem operations: Filter internal, show user-relevant
@@ -321,12 +381,9 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                     )
                     return sse_events
 
-            # task completion: Subagent returned
-            if tool_name == "task":
-                # Find which subagent completed
-                # The output contains the result from the subagent
-                output = event.get("data", {}).get("output", "")
-
+            # task/subagent completion: Subagent returned, restore previous context
+            if tool_name in ("task", "subagent"):
+                # Pop the completed subagent from the stack
                 if self._active_subagents:
                     subagent = self._active_subagents.pop()
                     sse_events.append(
@@ -334,14 +391,22 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                             event=SSEEventType.AGENT_ACTIVITY,
                             data=AgentActivityData(
                                 agent=subagent,
-                                action="complete",
+                                action="completed",
                                 tool_name="task",
                                 details="Subagent completed task",
                                 timestamp=timestamp,
                             ),
                         )
                     )
-                return sse_events
+
+                # Restore context to parent agent (previous subagent or orchestrator)
+                if self._active_subagents:
+                    self._current_agent = self._active_subagents[-1]
+                else:
+                    self._current_agent = "orchestrator"
+
+                logger.info(f"[SSE-OUT:{self._event_sequence:04d}] <<< COMPLETED subagent, restored to {self._current_agent}")
+                return self._log_sse_events(sse_events)
 
             # write_todos completion: Could update progress display
             if tool_name == "write_todos":
@@ -355,7 +420,8 @@ class DeepAgentEventMapper(LangGraphEventMapper):
         # =====================================================================
         # DELEGATE TO PARENT FOR STANDARD EVENTS
         # =====================================================================
-        return super().map_event(event)
+        parent_events = super().map_event(event)
+        return self._log_sse_events(parent_events)
 
     def _format_todos(self, todos: list[dict]) -> str:
         """Format todos for display in thinking event."""
@@ -381,11 +447,82 @@ class DeepAgentEventMapper(LangGraphEventMapper):
 
         return "\n".join(lines)
 
+    def _get_agent_name(self, event: dict) -> str:
+        """
+        Determine agent name from event metadata (stateless approach).
+
+        Maps LangGraph node names to UI agent names. This is robust because
+        it doesn't rely on tracking start/end states.
+
+        Uses checkpoint_ns (namespace) to detect if we're inside a subagent's
+        context, which is important for correctly attributing "tools" nodes.
+        """
+        metadata = event.get("metadata", {})
+        node_name = metadata.get("langgraph_node", "")
+        agent_name = metadata.get("lc_agent_name", "")
+        checkpoint_ns = metadata.get("checkpoint_ns", "")
+
+        # Use the most specific name available
+        name = agent_name or node_name
+
+        # Map Deep Agent node names to UI agent names
+        # Nodes that are subagents (will be nested in UI)
+        subagent_nodes = {
+            "integration_expert": "integration_expert",
+            "research_expert": "research_expert",
+            "web_researcher": "web_researcher",
+            "research-agent": "research_agent",
+            "web-researcher": "web_researcher",
+            "mentor-matcher": "mentor_matcher",
+            "general-purpose": "assistant",
+        }
+
+        # Check if we're inside a subagent's namespace
+        # checkpoint_ns format is typically "parent_node:child_node" or contains subagent name
+        subagent_from_ns = None
+        if checkpoint_ns:
+            for subagent_key in subagent_nodes:
+                if subagent_key in checkpoint_ns:
+                    subagent_from_ns = subagent_nodes[subagent_key]
+                    break
+
+        # If we're in a subagent namespace and the node is "tools" or "model",
+        # attribute to the subagent, not orchestrator
+        if subagent_from_ns and name in ("tools", "model", "agent"):
+            return subagent_from_ns
+
+        # Direct subagent node match
+        if name in subagent_nodes:
+            return subagent_nodes[name]
+
+        # Nodes that are the main orchestrator (shown at top level)
+        # Only use these if NOT inside a subagent namespace
+        orchestrator_nodes = {
+            "mentor-hub-agent": "orchestrator",
+            "model": "orchestrator",
+            "agent": "orchestrator",
+            "tools": "orchestrator",
+            "__start__": "orchestrator",
+            "__end__": "orchestrator",
+            "": "orchestrator",
+        }
+
+        if name in orchestrator_nodes and not subagent_from_ns:
+            return orchestrator_nodes[name]
+
+        # If unknown node, check if it looks like a subagent name
+        # (anything that's not explicitly orchestrator is treated as subagent)
+        if name and name not in ("orchestrator", "supervisor", "synthesizer"):
+            return name  # Return as-is, frontend will treat as subagent
+
+        return "orchestrator"
+
     def _map_agent_name(self, node_name: str) -> str:
         """Map internal node names to user-friendly names."""
         # First check Deep Agent specific names
         deep_agent_names = {
             "mentor-hub-agent": "orchestrator",
+            "model": "orchestrator",  # deepagents library internal model node
             "research-agent": "Research Agent",
             "web-researcher": "Web Researcher",
             "mentor-matcher": "Mentor Matcher",
@@ -397,3 +534,46 @@ class DeepAgentEventMapper(LangGraphEventMapper):
 
         # Fall back to parent mapping
         return super()._map_agent_name(node_name)
+
+    def _infer_subagent_name(self, task_description: str, tool_input: dict) -> str:
+        """
+        Infer subagent name from task description or tool input context.
+
+        Uses keyword matching to determine the type of agent being delegated to.
+        Returns a meaningful name or None if cannot be inferred.
+        """
+        if not task_description:
+            return "assistant"
+
+        task_lower = task_description.lower()
+
+        # Check for specific domain keywords
+        keyword_to_agent = {
+            # Integration/API agents
+            ("wrike", "integration", "api", "webhook", "sync"): "integration_expert",
+            # Research agents
+            ("research", "search", "find", "look up", "investigate"): "research_expert",
+            # Web/browsing agents
+            ("web", "browse", "scrape", "url", "website"): "web_researcher",
+            # Mentor matching
+            ("mentor", "match", "pairing", "assign"): "mentor_matcher",
+            # Data analysis
+            ("analyze", "analysis", "data", "report", "statistics"): "data_analyst",
+            # Code/development
+            ("code", "program", "develop", "implement", "fix bug"): "developer",
+            # Writing/content
+            ("write", "draft", "compose", "document", "email"): "writer",
+        }
+
+        for keywords, agent_name in keyword_to_agent.items():
+            if any(kw in task_lower for kw in keywords):
+                return agent_name
+
+        # Check if there's a subagent_type hint in tool_input metadata
+        if isinstance(tool_input.get("metadata"), dict):
+            agent_hint = tool_input["metadata"].get("agent_type") or tool_input["metadata"].get("subagent")
+            if agent_hint:
+                return agent_hint
+
+        # Default to assistant for general tasks
+        return "assistant"
