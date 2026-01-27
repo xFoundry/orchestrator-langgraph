@@ -1,0 +1,457 @@
+"""
+LLM Rate Limiter - Queue-based concurrency control for LLM API calls.
+
+This module provides rate limiting for LLM API calls to prevent 529 "Overloaded"
+errors from providers like OpenRouter. It implements:
+
+1. **Global concurrency limit**: Max parallel LLM calls across all users
+2. **Request queuing**: Calls wait their turn instead of failing
+3. **Retry with backoff**: Automatic retry on transient 529/503 errors
+
+Usage:
+    from app.middleware.llm_rate_limiter import RateLimitedChatModel
+
+    # Wrap any LangChain chat model
+    base_model = ChatOpenAI(model="claude-3.5-sonnet", ...)
+    model = RateLimitedChatModel(base_model)
+
+    # Use as normal - rate limiting is transparent
+    response = await model.ainvoke(messages)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+from typing import Any, AsyncIterator, Iterator, Optional
+
+from aiolimiter import AsyncLimiter
+from langchain_core.callbacks import AsyncCallbackManagerForLLMRun, CallbackManagerForLLMRun
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import BaseMessage
+from langchain_core.outputs import ChatGenerationChunk, ChatResult
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_random_exponential,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def is_retryable_error(exception: Exception) -> bool:
+    """
+    Check if an exception is retryable (transient API errors).
+
+    Retryable errors:
+    - 529: Overloaded (provider capacity)
+    - 503: Service Unavailable
+    - 502: Bad Gateway
+    - 504: Gateway Timeout
+    - Rate limit errors
+    """
+    error_str = str(exception).lower()
+    retryable_indicators = [
+        "529",
+        "overload",
+        "503",
+        "502",
+        "504",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "rate limit",
+        "too many requests",
+        "capacity",
+        "temporarily unavailable",
+    ]
+    return any(indicator in error_str for indicator in retryable_indicators)
+
+
+class LLMConcurrencyManager:
+    """
+    Singleton manager for LLM API call concurrency.
+
+    Provides a global semaphore and rate limiter that all LLM calls share.
+    This ensures that even when multiple sub-agents run in parallel,
+    their combined API calls stay within safe limits.
+    """
+
+    _instance: Optional[LLMConcurrencyManager] = None
+    _lock: asyncio.Lock = asyncio.Lock()
+
+    def __init__(
+        self,
+        max_concurrent: int = 5,
+        requests_per_second: float = 3.0,
+    ):
+        """
+        Initialize the concurrency manager.
+
+        Args:
+            max_concurrent: Maximum parallel LLM API calls (default: 5)
+            requests_per_second: Max requests per second (default: 3.0)
+        """
+        self.max_concurrent = max_concurrent
+        self.requests_per_second = requests_per_second
+
+        # Semaphore for concurrent request limiting
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+
+        # Token bucket rate limiter for smoothing request rate
+        self._rate_limiter = AsyncLimiter(
+            max_rate=requests_per_second,
+            time_period=1.0,
+        )
+
+        # Stats for monitoring
+        self._active_calls = 0
+        self._total_calls = 0
+        self._retried_calls = 0
+
+        logger.info(
+            f"LLM Concurrency Manager initialized: "
+            f"max_concurrent={max_concurrent}, rps={requests_per_second}"
+        )
+
+    @classmethod
+    async def get_instance(
+        cls,
+        max_concurrent: int = 5,
+        requests_per_second: float = 3.0,
+    ) -> LLMConcurrencyManager:
+        """Get or create the singleton instance."""
+        if cls._instance is None:
+            async with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls(
+                        max_concurrent=max_concurrent,
+                        requests_per_second=requests_per_second,
+                    )
+        return cls._instance
+
+    @classmethod
+    def get_instance_sync(
+        cls,
+        max_concurrent: int = 5,
+        requests_per_second: float = 3.0,
+    ) -> LLMConcurrencyManager:
+        """Get or create the singleton instance (sync version for init)."""
+        if cls._instance is None:
+            cls._instance = cls(
+                max_concurrent=max_concurrent,
+                requests_per_second=requests_per_second,
+            )
+        return cls._instance
+
+    async def acquire(self) -> None:
+        """
+        Acquire a slot for making an LLM API call.
+
+        This method:
+        1. Adds random jitter to prevent thundering herd
+        2. Waits for a semaphore slot (concurrency limit)
+        3. Waits for rate limiter (requests per second)
+        """
+        # Add jitter to stagger concurrent requests (0-100ms)
+        jitter = random.uniform(0, 0.1)
+        await asyncio.sleep(jitter)
+
+        # Wait for semaphore slot
+        await self._semaphore.acquire()
+        self._active_calls += 1
+        self._total_calls += 1
+
+        # Wait for rate limiter
+        await self._rate_limiter.acquire()
+
+        logger.debug(
+            f"LLM call acquired: active={self._active_calls}/{self.max_concurrent}, "
+            f"total={self._total_calls}"
+        )
+
+    def release(self) -> None:
+        """Release the slot after an LLM API call completes."""
+        self._semaphore.release()
+        self._active_calls -= 1
+        logger.debug(f"LLM call released: active={self._active_calls}/{self.max_concurrent}")
+
+    def record_retry(self) -> None:
+        """Record that a call was retried."""
+        self._retried_calls += 1
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get current stats for monitoring."""
+        return {
+            "active_calls": self._active_calls,
+            "max_concurrent": self.max_concurrent,
+            "total_calls": self._total_calls,
+            "retried_calls": self._retried_calls,
+            "requests_per_second": self.requests_per_second,
+        }
+
+
+class RateLimitedChatModel(BaseChatModel):
+    """
+    Wrapper that adds rate limiting and retry to any LangChain chat model.
+
+    This wrapper:
+    1. Queues LLM calls through a global concurrency manager
+    2. Retries on transient errors (529, 503, etc.) with exponential backoff
+    3. Is transparent to the rest of the application
+
+    The wrapper is compatible with LangChain's BaseChatModel interface,
+    so it can be used anywhere a chat model is expected.
+    """
+
+    # Pydantic fields
+    wrapped_model: BaseChatModel
+    """The underlying chat model to wrap."""
+
+    max_retries: int = 3
+    """Maximum number of retry attempts for transient errors."""
+
+    min_retry_wait: float = 1.0
+    """Minimum wait time between retries (seconds)."""
+
+    max_retry_wait: float = 30.0
+    """Maximum wait time between retries (seconds)."""
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def __init__(
+        self,
+        model: BaseChatModel,
+        max_retries: int = 3,
+        min_retry_wait: float = 1.0,
+        max_retry_wait: float = 30.0,
+        **kwargs: Any,
+    ):
+        """
+        Initialize the rate-limited model wrapper.
+
+        Args:
+            model: The underlying chat model to wrap
+            max_retries: Maximum retry attempts for transient errors
+            min_retry_wait: Minimum wait between retries (seconds)
+            max_retry_wait: Maximum wait between retries (seconds)
+        """
+        super().__init__(
+            wrapped_model=model,
+            max_retries=max_retries,
+            min_retry_wait=min_retry_wait,
+            max_retry_wait=max_retry_wait,
+            **kwargs,
+        )
+
+    @property
+    def _llm_type(self) -> str:
+        """Return the type of the underlying model."""
+        return f"rate_limited_{self.wrapped_model._llm_type}"
+
+    @property
+    def _identifying_params(self) -> dict[str, Any]:
+        """Return identifying parameters."""
+        return {
+            "wrapped_model": self.wrapped_model._identifying_params,
+            "max_retries": self.max_retries,
+        }
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """Synchronous generation - delegates to wrapped model."""
+        # For sync calls, we can't use async rate limiting
+        # Just pass through to the wrapped model
+        return self.wrapped_model._generate(
+            messages, stop=stop, run_manager=run_manager, **kwargs
+        )
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> ChatResult:
+        """
+        Async generation with rate limiting and retry.
+
+        This is the main entry point for async LLM calls.
+        """
+        manager = await LLMConcurrencyManager.get_instance()
+
+        # Create retry decorator with current settings
+        @retry(
+            retry=retry_if_exception(is_retryable_error),
+            wait=wait_random_exponential(
+                multiplier=1,
+                min=self.min_retry_wait,
+                max=self.max_retry_wait,
+            ),
+            stop=stop_after_attempt(self.max_retries),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True,
+        )
+        async def _call_with_retry() -> ChatResult:
+            await manager.acquire()
+            try:
+                return await self.wrapped_model._agenerate(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                )
+            except Exception as e:
+                if is_retryable_error(e):
+                    manager.record_retry()
+                    logger.warning(f"Retryable LLM error: {e}")
+                raise
+            finally:
+                manager.release()
+
+        return await _call_with_retry()
+
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> Iterator[ChatGenerationChunk]:
+        """Synchronous streaming - delegates to wrapped model."""
+        yield from self.wrapped_model._stream(
+            messages, stop=stop, run_manager=run_manager, **kwargs
+        )
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: Optional[list[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        """
+        Async streaming with rate limiting and retry.
+
+        For streaming, we acquire the rate limit slot before starting
+        and release it when the stream completes or errors.
+        """
+        manager = await LLMConcurrencyManager.get_instance()
+
+        # For streaming, we use a simpler retry approach
+        # since we can't easily retry mid-stream
+        last_error: Optional[Exception] = None
+
+        for attempt in range(self.max_retries):
+            await manager.acquire()
+            try:
+                async for chunk in self.wrapped_model._astream(
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                ):
+                    yield chunk
+                # Stream completed successfully
+                return
+            except Exception as e:
+                last_error = e
+                if is_retryable_error(e) and attempt < self.max_retries - 1:
+                    manager.record_retry()
+                    wait_time = min(
+                        self.max_retry_wait,
+                        self.min_retry_wait * (2 ** attempt) + random.uniform(0, 1),
+                    )
+                    logger.warning(
+                        f"Retryable streaming error (attempt {attempt + 1}/{self.max_retries}): {e}. "
+                        f"Retrying in {wait_time:.1f}s..."
+                    )
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
+            finally:
+                manager.release()
+
+        # If we get here, all retries failed
+        if last_error:
+            raise last_error
+
+    # Delegate other methods to the wrapped model
+    def bind_tools(self, *args: Any, **kwargs: Any) -> BaseChatModel:
+        """Bind tools to the wrapped model."""
+        bound = self.wrapped_model.bind_tools(*args, **kwargs)
+        # Return a new RateLimitedChatModel wrapping the bound model
+        return RateLimitedChatModel(
+            model=bound,
+            max_retries=self.max_retries,
+            min_retry_wait=self.min_retry_wait,
+            max_retry_wait=self.max_retry_wait,
+        )
+
+    def with_structured_output(self, *args: Any, **kwargs: Any) -> BaseChatModel:
+        """Add structured output to the wrapped model."""
+        structured = self.wrapped_model.with_structured_output(*args, **kwargs)
+        # Return a new RateLimitedChatModel wrapping the structured model
+        return RateLimitedChatModel(
+            model=structured,
+            max_retries=self.max_retries,
+            min_retry_wait=self.min_retry_wait,
+            max_retry_wait=self.max_retry_wait,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate unknown attributes to the wrapped model."""
+        return getattr(self.wrapped_model, name)
+
+
+def wrap_model_with_rate_limiting(
+    model: BaseChatModel,
+    max_retries: int = 3,
+    min_retry_wait: float = 1.0,
+    max_retry_wait: float = 30.0,
+) -> RateLimitedChatModel:
+    """
+    Convenience function to wrap a chat model with rate limiting.
+
+    Args:
+        model: The chat model to wrap
+        max_retries: Maximum retry attempts (default: 3)
+        min_retry_wait: Minimum retry wait in seconds (default: 1.0)
+        max_retry_wait: Maximum retry wait in seconds (default: 30.0)
+
+    Returns:
+        A RateLimitedChatModel wrapping the original model
+    """
+    return RateLimitedChatModel(
+        model=model,
+        max_retries=max_retries,
+        min_retry_wait=min_retry_wait,
+        max_retry_wait=max_retry_wait,
+    )
+
+
+def configure_global_rate_limits(
+    max_concurrent: int = 5,
+    requests_per_second: float = 3.0,
+) -> None:
+    """
+    Configure the global rate limits before creating any models.
+
+    This should be called once at application startup.
+
+    Args:
+        max_concurrent: Maximum parallel LLM API calls
+        requests_per_second: Maximum requests per second
+    """
+    # Create the singleton with specified settings
+    LLMConcurrencyManager.get_instance_sync(
+        max_concurrent=max_concurrent,
+        requests_per_second=requests_per_second,
+    )
+    logger.info(
+        f"Global LLM rate limits configured: "
+        f"max_concurrent={max_concurrent}, rps={requests_per_second}"
+    )

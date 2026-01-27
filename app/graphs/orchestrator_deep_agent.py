@@ -25,9 +25,13 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
 
-from app.config import get_settings, Settings
-from app.tools.tool_registry import create_default_registry
+from app.config import Settings, get_settings
+from app.middleware.llm_rate_limiter import (
+    configure_global_rate_limits,
+    wrap_model_with_rate_limiting,
+)
 from app.tools.error_handling import wrap_tools_with_error_handling
+from app.tools.tool_registry import create_default_registry
 
 logger = logging.getLogger(__name__)
 
@@ -63,13 +67,13 @@ def _create_anthropic_model(
     if settings.use_openrouter_for_anthropic and settings.openrouter_api_key:
         # OpenRouter uses OpenAI-compatible API with model names like "anthropic/claude-..."
         openrouter_model_name = f"anthropic/{model_name}"
-        
+
         log.info(f"Routing Anthropic model through OpenRouter: {openrouter_model_name}")
-        
+
         # Filter out Anthropic-specific kwargs that need special handling for OpenRouter
         anthropic_only_params = {"thinking", "anthropic_metadata", "anthropic_headers"}
         openrouter_kwargs = {k: v for k, v in model_kwargs.items() if k not in anthropic_only_params}
-        
+
         # Convert Anthropic's "thinking" parameter to OpenRouter's "reasoning" via extra_body
         # OpenRouter supports reasoning tokens for Anthropic models with max_tokens or effort
         extra_body = {}
@@ -87,7 +91,7 @@ def _create_anthropic_model(
                 "max_tokens": max(settings.deep_agent_thinking_budget, 1024),
             }
             log.info(f"Enabled OpenRouter reasoning with default budget: {settings.deep_agent_thinking_budget}")
-        
+
         # Use ChatOpenAI with OpenRouter's base URL
         return ChatOpenAI(
             model=openrouter_model_name,
@@ -437,6 +441,16 @@ async def create_orchestrator_deep_agent(
     logger.info(f"Creating Deep Agent for user: {user_id[:20]}...")
 
     # =========================================================================
+    # Configure Global LLM Rate Limits
+    # =========================================================================
+    # This prevents 529 "Overloaded" errors when multiple sub-agents run in parallel.
+    # Calls are queued through a global semaphore + rate limiter instead of failing.
+    configure_global_rate_limits(
+        max_concurrent=settings.llm_max_concurrent,
+        requests_per_second=settings.llm_requests_per_second,
+    )
+
+    # =========================================================================
     # Initialize Model with Thinking Support
     # =========================================================================
     # Use model_override if provided (from UI selection), otherwise fall back to settings
@@ -477,7 +491,7 @@ async def create_orchestrator_deep_agent(
     if ":" in model_name:
         provider = model_name.split(":", 1)[0].lower()
         actual_model_name = model_name.split(":", 1)[1]
-        
+
         if provider == "anthropic":
             model = _create_anthropic_model(settings, actual_model_name, model_kwargs, logger)
         elif provider == "openai":
@@ -514,6 +528,22 @@ async def create_orchestrator_deep_agent(
             api_key=settings.openai_api_key,
             **model_kwargs,
         )
+
+    # =========================================================================
+    # Wrap Model with Rate Limiting
+    # =========================================================================
+    # This ensures all LLM calls (from orchestrator AND sub-agents) go through
+    # the global rate limiter, preventing 529 "Overloaded" errors.
+    model = wrap_model_with_rate_limiting(
+        model,
+        max_retries=settings.llm_max_retries,
+        min_retry_wait=settings.llm_min_retry_wait,
+        max_retry_wait=settings.llm_max_retry_wait,
+    )
+    logger.info(
+        f"Model wrapped with rate limiting: max_concurrent={settings.llm_max_concurrent}, "
+        f"rps={settings.llm_requests_per_second}, retries={settings.llm_max_retries}"
+    )
 
     # =========================================================================
     # Get Tools from Registry (Scoped for Architecture)
@@ -563,6 +593,7 @@ async def create_orchestrator_deep_agent(
         """
         try:
             from deepagents.backends import StateBackend
+
             from app.backends.simple_scoped_store_backend import SimpleScopedStoreBackend
 
             if not filesystem_enabled:

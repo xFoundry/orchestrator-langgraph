@@ -40,6 +40,10 @@ dependencies = [
     # Utilities
     "python-dotenv>=1.0.0",
     "python-json-logger>=2.0.7",
+
+    # Rate limiting and retry
+    "aiolimiter>=1.1.0",
+    "tenacity>=8.2.0",
 ]
 
 [project.optional-dependencies]

@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
     openrouter_api_key: Optional[str] = None  # For routing Anthropic models via OpenRouter
-    
+
     # OpenRouter Settings
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     use_openrouter_for_anthropic: bool = True  # Route Anthropic models through OpenRouter
@@ -88,6 +88,13 @@ class Settings(BaseSettings):
 
     # LangGraph Execution Limits
     recursion_limit: int = 300  # Max graph steps (default 25 is too low for deep agents)
+
+    # LLM Rate Limiting (prevents 529 "Overloaded" errors from OpenRouter/providers)
+    llm_max_concurrent: int = 5  # Max parallel LLM API calls across all users/subagents
+    llm_requests_per_second: float = 3.0  # Max requests per second (smooths bursts)
+    llm_max_retries: int = 3  # Retry attempts for transient 529/503 errors
+    llm_min_retry_wait: float = 1.0  # Min wait between retries (seconds)
+    llm_max_retry_wait: float = 30.0  # Max wait between retries (seconds)
 
     @property
     def cors_origins_list(self) -> list[str]:
