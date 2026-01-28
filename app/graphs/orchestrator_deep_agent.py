@@ -179,7 +179,9 @@ For project management and collaboration tools (Wrike, Linear, GitHub, Slack):
 - Delegate to `integration-agent` using the `task` tool
 - The integration-agent handles: creating/updating tasks, fetching project status, managing workflows
 - Example: `task(agent="integration-agent", task="Create a Wrike task titled 'Review proposal' in folder X")`
-- For Wrike "my tasks": `task(agent="integration-agent", task="Get user's contact ID with wrike_get_my_contact_id, then call wrike_search_tasks with responsibles filter set to that ID and status=['Active']")`
+- For Wrike "my tasks": `task(agent="integration-agent", task="Get user's contact ID, then search ALL their tasks with limit=200 and include dates field")`
+- For comprehensive queries (overdue, not completed, missing): `task(agent="integration-agent", task="Get ALL tasks for user (no status filter, limit=200, include dates field), then categorize by status and identify overdue tasks by comparing due dates to today")`
+- IMPORTANT: When user asks about "overdue", "not completed", "all tasks", or needs comprehensive data, tell integration-agent to NOT pre-filter by status and to use a high limit (200)
 
 ## Guidelines
 
@@ -393,16 +395,17 @@ Available tools: {tool_list}
 IMPORTANT: Wrike MCP has specific tools for different operations. Use the correct one:
 
 **For listing/searching tasks - use `wrike_search_tasks`:**
-- Filter by assignee: `{{"responsibles": ["CONTACT_ID"], "limit": 20}}`
-- Include extra fields: `{{"fields": ["responsibleIds", "authorIds", "description"]}}`
-- Filter by status: `{{"status": ["Active"], "limit": 20}}`
-- Filter by folder: `{{"folderId": "FOLDER_ID", "limit": 20}}`
-- Combine filters: `{{"responsibles": ["CONTACT_ID"], "status": ["Active"], "fields": ["responsibleIds"], "limit": 20}}`
+- ALWAYS use a high limit (100-200) to get comprehensive results
+- Filter by assignee: `{{"responsibles": ["CONTACT_ID"], "limit": 200}}`
+- Include extra fields for dates: `{{"fields": ["responsibleIds", "authorIds", "description", "dates"]}}`
+- Filter by status: `{{"status": ["Active"], "limit": 200}}`
+- Filter by folder: `{{"folderId": "FOLDER_ID", "limit": 200}}`
+- DO NOT filter by status if user asks for "all tasks", "not completed", or comprehensive data
 
 **For getting full task details by ID - use `wrike_get_tasks`:**
 - REQUIRES task IDs: `{{"taskIds": ["TASK_ID1", "TASK_ID2"]}}`
 - Will fail with "taskIds cannot be empty" if called without IDs
-- Returns 27 fields including responsibles, description, customFields, etc.
+- Returns 27 fields including responsibles, description, customFields, dates, etc.
 - Only use this when you need full details not available from search
 
 **Other useful tools:**
@@ -412,9 +415,25 @@ IMPORTANT: Wrike MCP has specific tools for different operations. Use the correc
 
 **When a user asks "show my tasks" or "what are my Wrike tasks":**
 1. Call `wrike_get_my_contact_id` → get contact ID (e.g., "KUAWJGM6")
-2. Call `wrike_search_tasks` with: `{{"responsibles": ["KUAWJGM6"], "status": ["Active"], "fields": ["responsibleIds"], "limit": 20}}`
+2. Call `wrike_search_tasks` with: `{{"responsibles": ["KUAWJGM6"], "fields": ["responsibleIds", "dates"], "limit": 200}}`
 
-This returns tasks assigned to the user with IDs, titles, status, and assignee info in ONE call - no need for wrike_get_tasks.
+**For comprehensive task queries (overdue, not completed, missing, etc.):**
+1. Get user's contact ID with `wrike_get_my_contact_id`
+2. Fetch ALL tasks (no status filter) with high limit: `{{"responsibles": ["CONTACT_ID"], "fields": ["responsibleIds", "dates"], "limit": 200}}`
+3. Look at the `status` field in results to identify:
+   - Not completed: status is NOT "Completed" or "Cancelled"
+   - Active: status is "Active"
+   - Deferred: status is "Deferred"
+4. Look at `dates.due` field to identify overdue tasks:
+   - Compare `dates.due` to today's date
+   - Tasks with `dates.due` in the past AND status not "Completed" are OVERDUE
+5. "Missing" tasks might mean tasks without due dates - check if `dates.due` is null
+
+**IMPORTANT for comprehensive queries:**
+- Do NOT pre-filter by status when user asks about "overdue", "not completed", "all tasks", etc.
+- Fetch a large dataset first, then analyze/filter in your response
+- Always include the `dates` field to check due dates
+- Report the total count of tasks in each category
 
 ## General Guidelines
 
@@ -422,11 +441,13 @@ This returns tasks assigned to the user with IDs, titles, status, and assignee i
 - Handle rate limits gracefully (retry with backoff if needed)
 - For Wrike: Avoid parallel task mutations, call sequentially
 - Return structured summaries of actions taken
+- When asked for comprehensive data, use high limits and avoid restrictive filters
 
 Output format:
 - Action taken (created/updated/fetched)
 - Relevant IDs and links
 - Summary of results or status
+- For task lists: Include counts (e.g., "Found 45 tasks: 30 active, 10 overdue, 5 completed")
 
 Keep responses focused on the specific integration task.""",
                 "tools": integration_tools,
