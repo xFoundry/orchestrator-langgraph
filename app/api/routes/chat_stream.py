@@ -12,10 +12,12 @@ from fastapi.responses import StreamingResponse
 from langgraph.errors import GraphRecursionError
 
 from app.models.chat import ChatRequest
-from app.persistence.redis import get_thread_config
+from app.persistence.redis import get_thread_config, get_store
 from app.streaming import LangGraphEventMapper, SSEEvent, SSEEventType, ErrorData
+from app.streaming.sse_events import ThreadTitleData
 from app.streaming.deep_agent_event_mapper import DeepAgentEventMapper
-from app.api.routes.threads import update_thread_activity
+from app.api.routes.threads import update_thread_activity, get_thread_metadata_namespace
+from app.utils.thread_title import generate_thread_title
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -79,8 +81,9 @@ async def sse_event_generator(
                 user_context=user_context_dict,
                 auth0_id=auth0_id,
                 selected_tools=request.selected_tools,
+                model_override=request.model_override,
             )
-            logger.info("Using Deep Agent orchestrator")
+            logger.info(f"Using Deep Agent orchestrator with model: {request.model_override or 'default'}")
         elif use_v3:
             from app.graphs.orchestrator_v3 import get_orchestrator_v3
             graph = await get_orchestrator_v3(
@@ -174,6 +177,51 @@ async def sse_event_generator(
 
             # Allow other tasks to run
             await asyncio.sleep(0)
+
+        # Generate AI title for new threads after first response
+        try:
+            store = await get_store()
+            user_id = request.user_id or "anonymous"
+            tenant_id = request.tenant_id or "default"
+            namespace = get_thread_metadata_namespace(tenant_id, user_id)
+
+            # Get thread metadata
+            result = await store.aget(namespace, thread_id)
+            if result and result.value:
+                metadata = result.value
+                first_message = metadata.get("first_message")
+                current_title = metadata.get("title", "")
+                message_count = metadata.get("message_count", 0)
+
+                # Check if this is a new thread that needs AI title generation
+                # (title is still the truncated first message)
+                if first_message and message_count <= 2:
+                    # Get messages from checkpointer for title generation
+                    checkpointer = req.app.state.checkpointer
+                    checkpoint_tuple = await checkpointer.aget_tuple(config)
+
+                    if checkpoint_tuple and checkpoint_tuple.checkpoint:
+                        channel_values = checkpoint_tuple.checkpoint.get("channel_values", {})
+                        raw_messages = channel_values.get("messages", [])
+
+                        # Generate AI title
+                        ai_title = await generate_thread_title(raw_messages)
+
+                        if ai_title and ai_title != current_title:
+                            # Emit thread_title SSE event
+                            title_event = SSEEvent(
+                                event=SSEEventType.THREAD_TITLE,
+                                data=ThreadTitleData(title=ai_title),
+                            )
+                            yield title_event.to_sse_string()
+
+                            # Update thread metadata with AI-generated title
+                            metadata["title"] = ai_title
+                            await store.aput(namespace, thread_id, metadata)
+                            logger.info(f"Generated AI title for thread {thread_id}: {ai_title}")
+        except Exception as e:
+            logger.warning(f"Failed to generate AI title: {e}")
+            # Don't fail the request if title generation fails
 
         # Emit final complete event
         complete_event = mapper.create_complete_event(thread_id)

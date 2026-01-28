@@ -449,7 +449,7 @@ async def get_thread_messages(
             checkpoint_tuple = checkpointer.get_tuple(config)
 
         if not checkpoint_tuple or not checkpoint_tuple.checkpoint:
-            logger.debug(f"No checkpoint found for thread {thread_id}")
+            logger.warning(f"[Threads] No checkpoint found for thread {thread_id} - config={config}")
             return ThreadMessagesResponse(thread_id=thread_id, messages=[])
 
         # Extract messages from checkpoint channel_values
@@ -457,7 +457,7 @@ async def get_thread_messages(
         channel_values = checkpoint.get("channel_values", {})
         raw_messages = channel_values.get("messages", [])
 
-        logger.debug(f"Found {len(raw_messages)} messages in thread {thread_id}")
+        logger.info(f"[Threads] Found {len(raw_messages)} messages in thread {thread_id}")
 
         # Convert to ThreadMessage format
         messages: list[ThreadMessage] = []
