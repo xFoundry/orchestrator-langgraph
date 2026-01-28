@@ -15,6 +15,7 @@ from app.models.chat import ChatRequest
 from app.persistence.redis import get_thread_config
 from app.streaming import LangGraphEventMapper, SSEEvent, SSEEventType, ErrorData
 from app.streaming.deep_agent_event_mapper import DeepAgentEventMapper
+from app.api.routes.threads import update_thread_activity
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -110,6 +111,15 @@ async def sse_event_generator(
             thread_id=thread_id,
             user_id=request.user_id or "anonymous",
             tenant_id=request.tenant_id,
+        )
+
+        # Persist thread metadata (create or update)
+        await update_thread_activity(
+            thread_id=thread_id,
+            user_id=request.user_id or "anonymous",
+            tenant_id=request.tenant_id,
+            message_text=request.message,
+            model=request.model_override,
         )
 
         # Build message with memory instruction if needed
