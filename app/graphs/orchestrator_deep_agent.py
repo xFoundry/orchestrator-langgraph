@@ -179,6 +179,7 @@ For project management and collaboration tools (Wrike, Linear, GitHub, Slack):
 - Delegate to `integration-agent` using the `task` tool
 - The integration-agent handles: creating/updating tasks, fetching project status, managing workflows
 - Example: `task(agent="integration-agent", task="Create a Wrike task for...")`
+- For Wrike "my tasks" requests: `task(agent="integration-agent", task="Get tasks assigned to the current user using wrike_get_tasks_assigned_to_me")`
 
 ## Guidelines
 
@@ -387,7 +388,21 @@ Be specific about why each mentor is a good match.""",
 
 Available tools: {tool_list}
 
-Guidelines:
+## Wrike-Specific Guidelines
+
+IMPORTANT: Wrike MCP has specific tools for different operations. Use the correct one:
+
+- **To list tasks assigned to the current user**: Use `wrike_get_tasks_assigned_to_me` (NOT `wrike_get_tasks`)
+- **To get details of specific tasks**: Use `wrike_get_task_details` with a permalink URL
+- **To get tasks in a folder/project**: Use `wrike_get_folder_tasks` with a folder permalink
+- **To search/query tasks**: Use `wrike_query_tasks` with filters
+
+DO NOT use `wrike_get_tasks` without task IDs - it requires specific task IDs and will fail if called empty.
+
+When a user asks "show my tasks" or "what are my Wrike tasks", use `wrike_get_tasks_assigned_to_me`.
+
+## General Guidelines
+
 - Use the appropriate tool for each integration
 - Handle rate limits gracefully (retry with backoff if needed)
 - For Wrike: Avoid parallel task mutations, call sequentially

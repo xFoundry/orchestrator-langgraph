@@ -10,6 +10,7 @@ Extends the base LangGraphEventMapper to handle Deep Agent-specific events:
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from typing import Any
@@ -24,6 +25,7 @@ from app.streaming.sse_events import (
     TodoData,
     TodoItemData,
 )
+from app.tools.sanitize import sanitize_for_json
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +64,54 @@ class DeepAgentEventMapper(LangGraphEventMapper):
     def __init__(self) -> None:
         super().__init__()
         self._current_todos: list[dict] = []
-        self._active_subagents: list[str] = []  # Stack for nested subagent tracking
+        # Stack for nested subagent tracking (sequential): [{name: str, invocation_id: str, run_id: str}]
+        self._active_subagents: list[dict[str, str]] = []
+        # Map run_id -> invocation_id for parallel subagent tracking
+        # When multiple subagents run in parallel, each has a unique run_id
+        self._run_to_invocation: dict[str, str] = {}
+        # Map run_id -> agent_name for parallel tracking
+        self._run_to_agent: dict[str, str] = {}
+        self._current_invocation_id: str | None = None  # Current invocation ID for event attribution (fallback)
         self._artifact_writes: dict[str, dict[str, str]] = {}
         self._artifact_write_queue: list[dict[str, str]] = []
         self._event_sequence: int = 0  # Track event order for debugging
+
+    def _get_invocation_id_for_event(self, event: dict) -> str | None:
+        """
+        Look up the invocation_id for an event based on its context.
+
+        For parallel subagent tracking, we need to map events to their specific
+        invocation even when multiple subagents of the same type are running.
+
+        Priority:
+        1. Direct run_id match in _run_to_invocation
+        2. Parent run context from metadata
+        3. Current invocation_id (fallback)
+
+        Returns:
+            The invocation_id for this event, or None if not in subagent context
+        """
+        run_id = event.get("run_id") or event.get("data", {}).get("run_id")
+        metadata = event.get("metadata", {})
+
+        # Try direct run_id lookup
+        if run_id and run_id in self._run_to_invocation:
+            return self._run_to_invocation[run_id]
+
+        # Try to find parent run context from checkpoint_ns or parent_ids
+        parent_ids = metadata.get("parent_ids", [])
+        for parent_id in parent_ids:
+            if parent_id in self._run_to_invocation:
+                return self._run_to_invocation[parent_id]
+
+        # Try matching by agent name from active subagents
+        agent_name = self._get_agent_name(event)
+        for subagent in reversed(self._active_subagents):
+            if subagent.get("name") == agent_name:
+                return subagent.get("invocation_id")
+
+        # Fallback to current invocation_id
+        return self._current_invocation_id
 
     def _log_sse_events(self, events: list[SSEEvent]) -> list[SSEEvent]:
         """Log SSE events being emitted for sequence debugging."""
@@ -229,11 +275,18 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                 if not subagent_name:
                     subagent_name = "assistant"
 
+                # Generate unique invocation ID for this delegation
+                # Format: {sanitized_name}_{short_uuid} to enable parallel same-agent tracking
+                # Sanitize to ensure only alphanumeric, underscore, hyphen (safe for JSON/Redis)
+                safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', subagent_name)[:50]
+                invocation_id = f"{safe_name}_{uuid.uuid4().hex[:8]}"
+
                 # Emit delegation event BEFORE switching context
-                # Truncate task description for display
+                # Truncate task description for display and sanitize to remove control chars
                 display_task = task_description[:100]
                 if len(task_description) > 100:
                     display_task += "..."
+                safe_details = sanitize_for_json(f"Delegating: {display_task}")
 
                 sse_events.append(
                     SSEEvent(
@@ -242,18 +295,31 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                             agent=self._current_agent,
                             action="delegate",
                             tool_name=subagent_name,
-                            details=f"Delegating: {display_task}",
+                            details=safe_details,
                             timestamp=timestamp,
+                            invocation_id=invocation_id,
                         ),
                     )
                 )
 
                 # Now switch to subagent context - all subsequent tool calls
                 # will be attributed to this subagent until task completes
-                self._active_subagents.append(subagent_name)
+                self._active_subagents.append({
+                    "name": subagent_name,
+                    "invocation_id": invocation_id,
+                    "run_id": run_id or "",
+                })
                 self._current_agent = subagent_name
+                self._current_invocation_id = invocation_id
 
-                logger.info(f"[SSE-OUT:{self._event_sequence:04d}] >>> DELEGATE to {subagent_name}")
+                # Store run_id -> invocation_id mapping for parallel subagent tracking
+                # This allows us to route events to the correct invocation when multiple
+                # subagents of the same type run in parallel
+                if run_id:
+                    self._run_to_invocation[run_id] = invocation_id
+                    self._run_to_agent[run_id] = subagent_name
+
+                logger.info(f"[SSE-OUT:{self._event_sequence:04d}] >>> DELEGATE to {subagent_name} (invocation_id={invocation_id}, run_id={run_id})")
                 return self._log_sse_events(sse_events)
 
             # -----------------------------------------------------------------
@@ -296,6 +362,8 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                     action_type = "file"
 
                 # Emit activity event for all visible file operations
+                # Sanitize path in case it contains control characters
+                safe_details = sanitize_for_json(f"{action_desc}: {path}" if path else action_desc)
                 sse_events.append(
                     SSEEvent(
                         event=SSEEventType.AGENT_ACTIVITY,
@@ -303,8 +371,9 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                             agent=self._current_agent,
                             action=action_type,
                             tool_name=tool_name,
-                            details=f"{action_desc}: {path}" if path else action_desc,
+                            details=safe_details,
                             timestamp=timestamp,
+                            invocation_id=self._current_invocation_id,
                         ),
                     )
                 )
@@ -345,6 +414,9 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                     is_saved = "/artifacts/saved/" in path
                     action = "create" if tool_name == "write_file" else "update"
 
+                    # Sanitize content to remove control characters that break Redis JSON
+                    safe_content = sanitize_for_json(content) if content else ""
+
                     # Emit artifact event
                     sse_events.append(
                         SSEEvent(
@@ -354,7 +426,7 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                                 artifact_type="file",
                                 title=title,
                                 summary=path,
-                                payload={"path": path, "content": content, "action": action, "saved": is_saved},
+                                payload={"path": path, "content": safe_content, "action": action, "saved": is_saved},
                                 created_at=timestamp,
                             ),
                         )
@@ -374,8 +446,9 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                                 agent=self._current_agent,
                                 action="artifact",
                                 tool_name=tool_name,
-                                details=action_desc,
+                                details=sanitize_for_json(action_desc),
                                 timestamp=timestamp,
+                                invocation_id=self._current_invocation_id,
                             ),
                         )
                     )
@@ -385,27 +458,34 @@ class DeepAgentEventMapper(LangGraphEventMapper):
             if tool_name in ("task", "subagent"):
                 # Pop the completed subagent from the stack
                 if self._active_subagents:
-                    subagent = self._active_subagents.pop()
+                    subagent_info = self._active_subagents.pop()
+                    subagent_name = subagent_info["name"]
+                    completed_invocation_id = subagent_info["invocation_id"]
+
                     sse_events.append(
                         SSEEvent(
                             event=SSEEventType.AGENT_ACTIVITY,
                             data=AgentActivityData(
-                                agent=subagent,
+                                agent=subagent_name,
                                 action="completed",
-                                tool_name="task",
+                                tool_name=subagent_name,  # Use agent name for frontend matching
                                 details="Subagent completed task",
                                 timestamp=timestamp,
+                                invocation_id=completed_invocation_id,
                             ),
                         )
                     )
 
                 # Restore context to parent agent (previous subagent or orchestrator)
                 if self._active_subagents:
-                    self._current_agent = self._active_subagents[-1]
+                    parent_info = self._active_subagents[-1]
+                    self._current_agent = parent_info["name"]
+                    self._current_invocation_id = parent_info["invocation_id"]
                 else:
                     self._current_agent = "orchestrator"
+                    self._current_invocation_id = None
 
-                logger.info(f"[SSE-OUT:{self._event_sequence:04d}] <<< COMPLETED subagent, restored to {self._current_agent}")
+                logger.info(f"[SSE-OUT:{self._event_sequence:04d}] <<< COMPLETED subagent, restored to {self._current_agent} (invocation_id={self._current_invocation_id})")
                 return self._log_sse_events(sse_events)
 
             # write_todos completion: Could update progress display

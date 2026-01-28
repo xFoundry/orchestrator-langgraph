@@ -29,6 +29,22 @@ logger = logging.getLogger(__name__)
 # Removes: 0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, 0x7F (DEL)
 import re
 CONTROL_CHAR_REGEX = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+# Also match escaped Unicode control characters in JSON strings (e.g., \u0000, \u001f)
+# These survive json.dumps and need to be removed from the JSON string itself
+# Keep: \u0009 (tab), \u000a (newline), \u000d (carriage return)
+# Remove: \u0000-\u0008, \u000b, \u000c, \u000e-\u001f, \u007f
+def _remove_escaped_control_chars(json_str: str) -> str:
+    """Remove escaped Unicode control characters from JSON string, keeping tab/newline/CR."""
+    def replacer(match: re.Match) -> str:
+        # Get the matched escape sequence like \u0000
+        seq = match.group(0).lower()
+        # Keep tab, newline, carriage return
+        if seq in ('\\u0009', '\\u000a', '\\u000d'):
+            return match.group(0)
+        # Remove all other control characters
+        return ''
+    # Match all \u00XX patterns where XX is 00-1f or 7f
+    return re.sub(r'\\u00[0-1][0-9a-fA-F]|\\u007[fF]', replacer, json_str, flags=re.IGNORECASE)
 
 # Global checkpointer instance and context manager
 _checkpointer: Optional[BaseCheckpointSaver] = None
@@ -91,7 +107,13 @@ class SanitizingCheckpointSaver(BaseCheckpointSaver):
             return None
 
         if isinstance(value, str):
-            return CONTROL_CHAR_REGEX.sub('', value)
+            # Remove raw control characters
+            sanitized = CONTROL_CHAR_REGEX.sub('', value)
+            # Also check for escaped sequences that might cause issues when re-serialized
+            # These can appear if the string was previously JSON-encoded
+            if '\\u00' in sanitized or '\\u007' in sanitized:
+                sanitized = _remove_escaped_control_chars(sanitized)
+            return sanitized
 
         if isinstance(value, bytes):
             # Bytes might contain control chars when decoded
@@ -245,6 +267,7 @@ class SanitizingCheckpointSaver(BaseCheckpointSaver):
 
         try:
             # Serialize to JSON, converting non-serializable objects to strings
+            # Use ensure_ascii=True to escape all non-ASCII chars (safer for Redis)
             def default_handler(obj):
                 try:
                     # Try to get dict representation
@@ -255,10 +278,15 @@ class SanitizingCheckpointSaver(BaseCheckpointSaver):
                 except Exception:
                     return f"<{type(obj).__name__}>"
 
-            json_str = json.dumps(value, default=default_handler, ensure_ascii=False)
+            json_str = json.dumps(value, default=default_handler, ensure_ascii=True)
 
-            # Sanitize the JSON string
+            # Sanitize raw control characters (shouldn't be present after json.dumps, but just in case)
             sanitized_json = CONTROL_CHAR_REGEX.sub('', json_str)
+
+            # Also remove escaped Unicode control characters like \u0000, \u001f, \u007f
+            # These are the JSON-escaped forms that Redis JSON will reject
+            # But keep \u0009 (tab), \u000a (newline), \u000d (carriage return)
+            sanitized_json = _remove_escaped_control_chars(sanitized_json)
 
             # Deserialize back
             return json.loads(sanitized_json)

@@ -34,6 +34,7 @@ class AgentActivityData(BaseModel):
     tool_args: Optional[dict[str, Any]] = None
     details: Optional[str] = None
     timestamp: Optional[float] = None
+    invocation_id: Optional[str] = None  # Unique ID for parallel subagent tracking
 
 
 class TextChunkData(BaseModel):
@@ -42,6 +43,7 @@ class TextChunkData(BaseModel):
     chunk: str
     agent: str
     is_partial: bool = True
+    invocation_id: Optional[str] = None  # Unique ID for parallel subagent tracking
 
 
 class CitationData(BaseModel):
@@ -79,6 +81,7 @@ class ToolResultData(BaseModel):
     tool_name: str
     result_summary: Optional[str] = None
     success: bool = True
+    invocation_id: Optional[str] = None  # Unique ID for parallel subagent tracking
 
 
 class ThinkingData(BaseModel):
@@ -88,6 +91,7 @@ class ThinkingData(BaseModel):
     content: str
     agent: str
     timestamp: Optional[float] = None
+    invocation_id: Optional[str] = None  # Unique ID for parallel subagent tracking
 
 
 class TodoItemData(BaseModel):

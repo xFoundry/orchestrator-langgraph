@@ -79,15 +79,33 @@ class LangGraphEventMapper:
         self.agent_trace: list[AgentActivityData] = []
         self._seen_citation_sources: set[str] = set()
         self._current_agent: str = "orchestrator"
+        self._current_invocation_id: Optional[str] = None  # For parallel subagent tracking
         self._active_tools: set[str] = set()  # Track tools currently running
         self._handoff_summary: Optional[str] = None
         self._handoff_recent_messages: Optional[list[dict[str, Any]]] = None
-        # Accumulate thinking content per-agent to emit as single event (not per-chunk)
-        # Dict maps agent name -> accumulated thinking content
-        self._accumulated_thinking: dict[str, str] = {}
+        # Accumulate thinking content per-invocation to emit as single event (not per-chunk)
+        # Dict maps (invocation_id or agent_name) -> {content, agent, invocation_id}
+        # Using invocation_id as key enables parallel subagent support
+        self._accumulated_thinking: dict[str, dict[str, Any]] = {}
         # Accumulate UI events for persistence (so they can be restored when loading thread)
         # These are stored alongside the thread and used to reconstruct the UI on reload
         self._ui_events: list[dict[str, Any]] = []
+
+    def _get_invocation_id_for_event(self, event: dict[str, Any]) -> Optional[str]:
+        """
+        Get the invocation_id for an event. Override in subclasses for parallel tracking.
+
+        The base implementation just returns the current invocation_id.
+        Subclasses can override this to do more sophisticated lookup based on
+        run_id mapping for parallel subagent support.
+
+        Args:
+            event: The LangGraph event
+
+        Returns:
+            The invocation_id for this event, or None
+        """
+        return self._current_invocation_id
 
     def map_event(self, event: dict[str, Any]) -> list[SSEEvent]:
         """
@@ -162,32 +180,45 @@ class LangGraphEventMapper:
                         elif isinstance(details, str):
                             thinking_content += details
 
-                # Accumulate thinking content per-agent (don't emit per-chunk to avoid UI spam)
+                # Accumulate thinking content per-invocation (don't emit per-chunk to avoid UI spam)
                 # Will emit when response text starts or at stream end
+                # Use invocation_id as key for parallel subagent support, fallback to agent name
                 if thinking_content:
                     agent = self._current_agent
-                    if agent not in self._accumulated_thinking:
-                        self._accumulated_thinking[agent] = ""
-                    self._accumulated_thinking[agent] += thinking_content
+                    invocation_id = self._get_invocation_id_for_event(event)
+                    # Use invocation_id as key if available, else agent name (for orchestrator)
+                    thinking_key = invocation_id or agent
+                    if thinking_key not in self._accumulated_thinking:
+                        self._accumulated_thinking[thinking_key] = {
+                            "content": "",
+                            "agent": agent,
+                            "invocation_id": invocation_id,
+                        }
+                    self._accumulated_thinking[thinking_key]["content"] += thinking_content
 
                 if content:
                     # Text content means response has started - emit accumulated thinking first
-                    # Emit thinking for the current agent if any
+                    # Use invocation_id as key for parallel subagent support
                     agent = self._current_agent
-                    if agent in self._accumulated_thinking and self._accumulated_thinking[agent]:
-                        sse_events.append(
-                            SSEEvent(
-                                event=SSEEventType.THINKING,
-                                data=ThinkingData(
-                                    phase="reasoning",
-                                    content=self._accumulated_thinking[agent],
-                                    agent=agent,
-                                    timestamp=timestamp,
-                                ),
+                    invocation_id = self._get_invocation_id_for_event(event)
+                    thinking_key = invocation_id or agent
+                    if thinking_key in self._accumulated_thinking:
+                        thinking_data = self._accumulated_thinking[thinking_key]
+                        if thinking_data.get("content"):
+                            sse_events.append(
+                                SSEEvent(
+                                    event=SSEEventType.THINKING,
+                                    data=ThinkingData(
+                                        phase="reasoning",
+                                        content=thinking_data["content"],
+                                        agent=thinking_data.get("agent", agent),
+                                        timestamp=timestamp,
+                                        invocation_id=thinking_data.get("invocation_id"),
+                                    ),
+                                )
                             )
-                        )
-                        # Reset after emitting
-                        self._accumulated_thinking[agent] = ""
+                            # Reset content after emitting (keep entry for potential more thinking)
+                            self._accumulated_thinking[thinking_key]["content"] = ""
                     tags = set(event.get("tags") or [])
                     tags.update(metadata.get("tags") or [])
                     purpose = metadata.get("purpose")
@@ -217,6 +248,7 @@ class LangGraphEventMapper:
                                     chunk=content,
                                     agent=self._current_agent,
                                     is_partial=True,
+                                    invocation_id=invocation_id,
                                 ),
                             )
                         )
@@ -235,6 +267,7 @@ class LangGraphEventMapper:
             # Tool invocation started
             tool_name = event.get("name", "unknown")
             tool_input = event.get("data", {}).get("input", {})
+            invocation_id = self._get_invocation_id_for_event(event)
 
             # Track this tool as active
             self._active_tools.add(tool_name)
@@ -252,6 +285,7 @@ class LangGraphEventMapper:
                 tool_args=safe_tool_input if isinstance(safe_tool_input, dict) else {"input": safe_tool_input},
                 details=tool_description,
                 timestamp=timestamp,
+                invocation_id=invocation_id,
             )
             self.agent_trace.append(activity)
             sse_events.append(
@@ -262,6 +296,7 @@ class LangGraphEventMapper:
             # Tool execution completed
             tool_name = event.get("name", "unknown")
             output = event.get("data", {}).get("output")
+            invocation_id = self._get_invocation_id_for_event(event)
 
             # Check if the tool returned an error
             tool_success = True
@@ -284,6 +319,7 @@ class LangGraphEventMapper:
                         tool_name=tool_name,
                         result_summary=result_summary,
                         success=tool_success,
+                        invocation_id=invocation_id,
                     ),
                 )
             )
@@ -299,6 +335,7 @@ class LangGraphEventMapper:
             # Custom events emitted via get_stream_writer()
             custom_data = event.get("data", {})
             event_type = custom_data.get("type")
+            invocation_id = self._get_invocation_id_for_event(event)
 
             if event_type == "thinking":
                 sse_events.append(
@@ -309,6 +346,7 @@ class LangGraphEventMapper:
                             content=custom_data.get("content", ""),
                             agent=custom_data.get("agent", self._current_agent),
                             timestamp=timestamp,
+                            invocation_id=invocation_id,
                         ),
                     )
                 )
@@ -318,6 +356,7 @@ class LangGraphEventMapper:
                     action="thinking",
                     details=f"[{custom_data.get('phase', '').upper()}] {custom_data.get('content', '')[:100]}...",
                     timestamp=timestamp,
+                    invocation_id=invocation_id,
                 )
                 self.agent_trace.append(activity)
 
@@ -391,6 +430,7 @@ class LangGraphEventMapper:
                                     content=content,
                                     agent=self._current_agent,
                                     timestamp=timestamp,
+                                    invocation_id=invocation_id,
                                 ),
                             )
                         )
@@ -400,12 +440,14 @@ class LangGraphEventMapper:
                             action="thinking",
                             details=f"[{phase.upper()}] {content[:100]}...",
                             timestamp=timestamp,
+                            invocation_id=invocation_id,
                         )
                         self.agent_trace.append(activity)
 
         elif kind == "on_chain_start":
             # Subgraph/chain invocation - only show meaningful delegations
             chain_name = event.get("name", "")
+            invocation_id = self._get_invocation_id_for_event(event)
 
             # Skip internal ReAct nodes - these are implementation noise
             if not chain_name or chain_name in self.INTERNAL_NODE_NAMES:
@@ -421,6 +463,7 @@ class LangGraphEventMapper:
                     tool_name=chain_name,
                     details=action_details,
                     timestamp=timestamp,
+                    invocation_id=invocation_id,
                 )
                 self.agent_trace.append(activity)
                 sse_events.append(
@@ -436,6 +479,7 @@ class LangGraphEventMapper:
                     tool_name=chain_name,
                     details=f"Delegating to {readable_name}",
                     timestamp=timestamp,
+                    invocation_id=invocation_id,
                 )
                 self.agent_trace.append(activity)
                 sse_events.append(
@@ -778,16 +822,19 @@ class LangGraphEventMapper:
         events: list[SSEEvent] = []
         timestamp = time.time()
 
-        # Emit any remaining accumulated thinking for all agents
-        for agent, thinking in list(self._accumulated_thinking.items()):
-            if thinking:
+        # Emit any remaining accumulated thinking for all invocations
+        # Dict structure: {thinking_key: {content, agent, invocation_id}}
+        for thinking_key, thinking_data in list(self._accumulated_thinking.items()):
+            content = thinking_data.get("content", "")
+            if content:
                 event = SSEEvent(
                     event=SSEEventType.THINKING,
                     data=ThinkingData(
                         phase="reasoning",
-                        content=thinking,
-                        agent=agent,
+                        content=content,
+                        agent=thinking_data.get("agent", "orchestrator"),
                         timestamp=timestamp,
+                        invocation_id=thinking_data.get("invocation_id"),
                     ),
                 )
                 events.append(event)
