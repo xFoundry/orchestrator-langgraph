@@ -178,8 +178,8 @@ For missing or ambiguous details:
 For project management and collaboration tools (Wrike, Linear, GitHub, Slack):
 - Delegate to `integration-agent` using the `task` tool
 - The integration-agent handles: creating/updating tasks, fetching project status, managing workflows
-- Example: `task(agent="integration-agent", task="Create a Wrike task for...")`
-- For Wrike "my tasks" requests: `task(agent="integration-agent", task="Get tasks assigned to the current user using wrike_get_tasks_assigned_to_me")`
+- Example: `task(agent="integration-agent", task="Create a Wrike task titled 'Review proposal' in folder X")`
+- For Wrike "my tasks": `task(agent="integration-agent", task="Get user's contact ID with wrike_get_my_contact_id, then call wrike_search_tasks with responsibles filter set to that ID and status=['Active']")`
 
 ## Guidelines
 
@@ -392,14 +392,29 @@ Available tools: {tool_list}
 
 IMPORTANT: Wrike MCP has specific tools for different operations. Use the correct one:
 
-- **To list tasks assigned to the current user**: Use `wrike_get_tasks_assigned_to_me` (NOT `wrike_get_tasks`)
-- **To get details of specific tasks**: Use `wrike_get_task_details` with a permalink URL
-- **To get tasks in a folder/project**: Use `wrike_get_folder_tasks` with a folder permalink
-- **To search/query tasks**: Use `wrike_query_tasks` with filters
+**For listing/searching tasks - use `wrike_search_tasks`:**
+- Filter by assignee: `{{"responsibles": ["CONTACT_ID"], "limit": 20}}`
+- Include extra fields: `{{"fields": ["responsibleIds", "authorIds", "description"]}}`
+- Filter by status: `{{"status": ["Active"], "limit": 20}}`
+- Filter by folder: `{{"folderId": "FOLDER_ID", "limit": 20}}`
+- Combine filters: `{{"responsibles": ["CONTACT_ID"], "status": ["Active"], "fields": ["responsibleIds"], "limit": 20}}`
 
-DO NOT use `wrike_get_tasks` without task IDs - it requires specific task IDs and will fail if called empty.
+**For getting full task details by ID - use `wrike_get_tasks`:**
+- REQUIRES task IDs: `{{"taskIds": ["TASK_ID1", "TASK_ID2"]}}`
+- Will fail with "taskIds cannot be empty" if called without IDs
+- Returns 27 fields including responsibles, description, customFields, etc.
+- Only use this when you need full details not available from search
 
-When a user asks "show my tasks" or "what are my Wrike tasks", use `wrike_get_tasks_assigned_to_me`.
+**Other useful tools:**
+- `wrike_get_my_contact_id` - Get current user's contact ID (returns ID like "KUAWJGM6")
+- `wrike_search_folder_project` - Search folders/projects
+- `wrike_get_contacts` - Get contact details
+
+**When a user asks "show my tasks" or "what are my Wrike tasks":**
+1. Call `wrike_get_my_contact_id` → get contact ID (e.g., "KUAWJGM6")
+2. Call `wrike_search_tasks` with: `{{"responsibles": ["KUAWJGM6"], "status": ["Active"], "fields": ["responsibleIds"], "limit": 20}}`
+
+This returns tasks assigned to the user with IDs, titles, status, and assignee info in ONE call - no need for wrike_get_tasks.
 
 ## General Guidelines
 
