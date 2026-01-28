@@ -10,7 +10,7 @@ Also sanitizes tool outputs to prevent JSON serialization errors in Redis checkp
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, Type
+from typing import Any, Optional, Type, Union
 
 from langchain_core.callbacks import CallbackManagerForToolRun
 from langchain_core.runnables import RunnableConfig
@@ -20,6 +20,9 @@ from pydantic import BaseModel
 from app.tools.sanitize import sanitize_for_json
 
 logger = logging.getLogger(__name__)
+
+# Type alias for tool call schemas (Pydantic model or dict JSON schema)
+ArgsSchema = Union[Type[BaseModel], dict[str, Any]]
 
 
 class ErrorHandlingToolWrapper(BaseTool):
@@ -39,7 +42,8 @@ class ErrorHandlingToolWrapper(BaseTool):
       to avoid @property which causes infinite recursion in LangChain's schema inspector.
     - For args_schema, MCP tools may return a dict (JSON Schema) instead of a BaseModel
       subclass. We set args_schema=None to pass Pydantic validation, then override
-      get_input_schema() to delegate to the wrapped tool so the LLM still sees the schema.
+      tool_call_schema property to delegate to the wrapped tool so the LLM sees the
+      correct parameter schema including required fields.
     """
 
     wrapped_tool: BaseTool
@@ -57,7 +61,7 @@ class ErrorHandlingToolWrapper(BaseTool):
         schema = wrapped_tool.args_schema
         if schema is not None and not (isinstance(schema, type) and issubclass(schema, BaseModel)):
             # Not a valid BaseModel subclass (likely a dict from MCP)
-            # Set to None to pass Pydantic validation; get_input_schema() handles the rest
+            # Set to None to pass Pydantic validation; tool_call_schema handles the rest
             schema = None
 
         super().__init__(
@@ -68,13 +72,25 @@ class ErrorHandlingToolWrapper(BaseTool):
             **kwargs,
         )
 
+    @property
+    def tool_call_schema(self) -> ArgsSchema:
+        """
+        Delegate to the wrapped tool's tool_call_schema.
+
+        Critical: LangChain's convert_to_openai_tool uses this property to generate
+        the schema sent to the LLM. For MCP tools with dict schemas, the wrapped tool
+        knows how to return them correctly. By delegating here instead of using our
+        args_schema (which may be None), we preserve the full schema including
+        required fields.
+        """
+        return self.wrapped_tool.tool_call_schema
+
     def get_input_schema(self, config: Optional[Any] = None) -> Type[BaseModel]:
         """
         Delegate schema generation to the wrapped tool.
 
-        This is critical because we may have set self.args_schema = None in __init__
-        to avoid Pydantic validation errors with MCP tools that use dict schemas.
-        By delegating to the wrapped tool, the LLM still sees the correct argument schema.
+        This is used for some internal LangChain operations but tool_call_schema
+        is what actually gets sent to the LLM.
         """
         return self.wrapped_tool.get_input_schema(config)
 
