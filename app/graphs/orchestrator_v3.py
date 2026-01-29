@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 from app.config import get_settings
+from app.utils.http_client import get_http_client
 from app.tools.graph_tools import query_graph, search_text, find_entity, get_graph_schema
 from app.tools.cognee_tools import search_chunks, search_summaries, search_graph, search_rag
 from app.tools.mentor_hub_tools import get_mentor_hub_tools
@@ -449,6 +450,7 @@ async def planner_node(state: OrchestratorV3State) -> dict[str, Any]:
         model=settings.default_orchestrator_model,
         api_key=settings.openai_api_key,
         temperature=0.1,  # Low temperature for consistent planning
+        http_async_client=get_http_client(),
     )
 
     # Build context for the planner
@@ -776,6 +778,7 @@ async def evaluator_node(state: OrchestratorV3State) -> dict[str, Any]:
         model=settings.default_research_model,
         api_key=settings.openai_api_key,
         temperature=0,
+        http_async_client=get_http_client(),
     )
 
     # Summarize results for evaluation
@@ -1034,6 +1037,7 @@ async def _handle_conversational_query(
         model=settings.default_orchestrator_model,
         api_key=settings.openai_api_key,
         temperature=0.7,  # Slightly higher for conversational tone
+        http_async_client=get_http_client(),
     )
 
     # Build context
@@ -1105,6 +1109,7 @@ async def synthesizer_node(state: OrchestratorV3State) -> dict[str, Any]:
         model=settings.default_orchestrator_model,
         api_key=settings.openai_api_key,
         streaming=True,
+        http_async_client=get_http_client(),
     )
 
     # Build context
@@ -2146,6 +2151,7 @@ async def _generate_handoff_summary(
         api_key=api_key,
         temperature=0.2,
         max_tokens=max_tokens,
+        http_async_client=get_http_client(),
     )
 
     message_lines = []

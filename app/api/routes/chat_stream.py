@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import traceback
 import uuid
 from typing import AsyncGenerator
 
+import httpx
+import httpcore
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 from langgraph.errors import GraphRecursionError
@@ -241,8 +244,37 @@ async def sse_event_generator(
         error_event = mapper.create_error_event(error_msg)
         yield error_event.to_sse_string()
 
+    except (httpcore.RemoteProtocolError, httpx.RemoteProtocolError) as e:
+        # HTTP/2 connection desync - likely Railway proxy closed the connection
+        logger.error(
+            f"HTTP/2 connection error (RemoteProtocolError): {type(e).__name__}: {e}\n"
+            f"This typically indicates the Railway proxy closed an idle HTTP/2 connection.\n"
+            f"Stack trace:\n{traceback.format_exc()}"
+        )
+        error_msg = (
+            "Connection interrupted. The request was processing but the connection was reset. "
+            "This is usually a temporary network issue - please try again."
+        )
+        error_event = mapper.create_error_event(error_msg)
+        yield error_event.to_sse_string()
+
+    except (httpx.ReadError, httpx.ConnectError, httpx.TimeoutException) as e:
+        # Network-level errors
+        logger.error(
+            f"Network error during streaming: {type(e).__name__}: {e}\n"
+            f"Stack trace:\n{traceback.format_exc()}"
+        )
+        error_msg = f"Network error: {type(e).__name__}. Please try again."
+        error_event = mapper.create_error_event(error_msg)
+        yield error_event.to_sse_string()
+
     except Exception as e:
-        logger.error(f"SSE streaming error: {e}", exc_info=True)
+        # Log detailed exception info for debugging
+        logger.error(
+            f"SSE streaming error: {type(e).__name__}: {e}\n"
+            f"Exception class: {type(e).__module__}.{type(e).__qualname__}\n"
+            f"Stack trace:\n{traceback.format_exc()}"
+        )
         error_event = mapper.create_error_event(str(e))
         yield error_event.to_sse_string()
 

@@ -15,6 +15,7 @@ from app.persistence.redis import get_checkpointer, close_checkpointer, get_stor
 from app.db import init_db
 from app.api.routes import chat, chat_stream, files, threads, integrations
 from app.api.dependencies import verify_api_key
+from app.utils.http_client import close_http_client
 
 # Configure logging
 settings = get_settings()
@@ -76,6 +77,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Cleanup
     logger.info("Shutting down orchestrator-langgraph service")
+    await close_http_client()
     await close_checkpointer()
     await close_store()
 

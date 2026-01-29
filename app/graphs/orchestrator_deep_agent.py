@@ -26,6 +26,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
 
 from app.config import Settings, get_settings
+from app.utils.http_client import get_http_client
 from app.middleware.llm_rate_limiter import (
     configure_global_rate_limits,
     wrap_model_with_rate_limiting,
@@ -93,6 +94,7 @@ def _create_anthropic_model(
             log.info(f"Enabled OpenRouter reasoning with default budget: {settings.deep_agent_thinking_budget}")
 
         # Use ChatOpenAI with OpenRouter's base URL
+        # IMPORTANT: Use custom HTTP/1.1 client to prevent connection desync with Railway proxy
         return ChatOpenAI(
             model=openrouter_model_name,
             api_key=settings.openrouter_api_key,
@@ -105,6 +107,8 @@ def _create_anthropic_model(
             },
             # Pass reasoning config via extra_body for OpenRouter
             model_kwargs={"extra_body": extra_body} if extra_body else {},
+            # Use HTTP/1.1 client to prevent "terminated" errors from HTTP/2 connection desync
+            http_async_client=get_http_client(),
             **openrouter_kwargs,
         )
     elif settings.anthropic_api_key:
@@ -551,6 +555,8 @@ async def create_orchestrator_deep_agent(
                 model = ChatOpenAI(
                     model=actual_model_name,
                     api_key=settings.openai_api_key,
+                    # Use HTTP/1.1 client to prevent "terminated" errors from HTTP/2 connection desync
+                    http_async_client=get_http_client(),
                     **model_kwargs,
                 )
                 logger.info(f"Using ChatOpenAI directly for {actual_model_name} with reasoning support")
@@ -569,6 +575,8 @@ async def create_orchestrator_deep_agent(
         model = ChatOpenAI(
             model=model_name,
             api_key=settings.openai_api_key,
+            # Use HTTP/1.1 client to prevent "terminated" errors from HTTP/2 connection desync
+            http_async_client=get_http_client(),
             **model_kwargs,
         )
         logger.info(f"Using ChatOpenAI directly for {model_name} with reasoning support")

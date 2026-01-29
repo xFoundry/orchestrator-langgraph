@@ -10,6 +10,7 @@ from langchain_core.callbacks.manager import adispatch_custom_event
 from langchain_openai import ChatOpenAI
 
 from app.config import get_settings
+from app.utils.http_client import get_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,8 @@ async def generate_thread_title(
             api_key=settings.openai_api_key,
             temperature=0,
             max_tokens=50,
+            # Use HTTP/1.1 client to prevent "terminated" errors from HTTP/2 connection desync
+            http_async_client=get_http_client(),
         )
         
         # Build the prompt

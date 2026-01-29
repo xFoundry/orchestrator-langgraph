@@ -90,11 +90,13 @@ class Settings(BaseSettings):
     recursion_limit: int = 300  # Max graph steps (default 25 is too low for deep agents)
 
     # LLM Rate Limiting (prevents 529 "Overloaded" errors from OpenRouter/providers)
-    llm_max_concurrent: int = 5  # Max parallel LLM API calls across all users/subagents
-    llm_requests_per_second: float = 3.0  # Max requests per second (smooths bursts)
-    llm_max_retries: int = 3  # Retry attempts for transient 529/503 errors
+    # These limits are fairly permissive since we have retry logic with exponential backoff,
+    # and async execution naturally staggers requests. The retry mechanism handles occasional 529s.
+    llm_max_concurrent: int = 12  # Max parallel LLM API calls across all users/subagents
+    llm_requests_per_second: float = 8.0  # Max requests per second (smooths bursts)
+    llm_max_retries: int = 4  # Retry attempts for transient 529/503 errors
     llm_min_retry_wait: float = 1.0  # Min wait between retries (seconds)
-    llm_max_retry_wait: float = 30.0  # Max wait between retries (seconds)
+    llm_max_retry_wait: float = 60.0  # Max wait between retries (seconds)
 
     @property
     def cors_origins_list(self) -> list[str]:
