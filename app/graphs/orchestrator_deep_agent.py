@@ -139,6 +139,8 @@ SYSTEM_PROMPT = """You are an AI assistant for Mentor Hub, a mentorship platform
    - Mark items in progress/completed as you go.
 2. **Context Management**: Use filesystem tools to store/retrieve large context.
 3. **Delegation**: Use the `task` tool to spawn subagents for specialized deep work.
+   - When delegating, provide a `display_name` in the format: "<Role> – <Concise task description>"
+   - Examples: "Web Researcher – Social Media Presence Audit", "Research Agent – Competitor Analysis"
 4. **Tools**: Knowledge graph search, live Mentor Hub data, Outline documents, and web research.
 5. **Clarifications**: Use `request_clarifications` when key details are missing.
 

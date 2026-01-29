@@ -292,7 +292,12 @@ async def list_threads(
     """
     logger.critical(f"===== LIST_THREADS CALLED: user_id={user_id[:20]}..., tenant_id={tenant_id}, limit={limit}, offset={offset} =====")
 
-    store = await get_store()
+    try:
+        store = await get_store()
+    except Exception as e:
+        logger.error(f"Failed to get store: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail=f"Store unavailable: {e}")
+
     namespace = get_thread_metadata_namespace(tenant_id, user_id)
 
     logger.debug(f"[Threads] Listing threads for user_id={user_id[:20]}..., namespace={namespace}")
@@ -301,6 +306,7 @@ async def list_threads(
         # Get all thread metadata for this user (use async search)
         # Note: LangGraph store asearch defaults to limit=10, so we need to set a higher limit
         items = await store.asearch(namespace, limit=1000)
+        items = list(items) if items else []  # Ensure we have a list, not a generator
         logger.info(f"[Threads] asearch returned {len(items)} raw items from namespace {namespace}")
 
         # Debug: log all item keys
@@ -378,7 +384,7 @@ async def list_threads(
         )
 
     except Exception as e:
-        logger.error(f"Error listing threads: {e}")
+        logger.error(f"Error listing threads: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to list threads: {e}")
 
 

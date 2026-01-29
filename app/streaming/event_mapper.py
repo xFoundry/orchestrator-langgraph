@@ -7,7 +7,7 @@ import re
 import time
 from typing import Any, Optional
 
-from app.tools.sanitize import make_json_serializable
+from app.tools.sanitize import make_json_serializable, sanitize_for_json
 from app.streaming.sse_events import (
     SSEEvent,
     SSEEventType,
@@ -90,6 +90,8 @@ class LangGraphEventMapper:
         # Accumulate UI events for persistence (so they can be restored when loading thread)
         # These are stored alongside the thread and used to reconstruct the UI on reload
         self._ui_events: list[dict[str, Any]] = []
+        # Sequence number for tool timeline ordering
+        self._tool_sequence: int = 0
 
     def _get_invocation_id_for_event(self, event: dict[str, Any]) -> Optional[str]:
         """
@@ -197,6 +199,10 @@ class LangGraphEventMapper:
                     self._accumulated_thinking[thinking_key]["content"] += thinking_content
 
                 if content:
+                    # Sanitize content to remove control characters that cause garbled output
+                    # This fixes garbled markdown in subagent responses
+                    content = sanitize_for_json(content) if isinstance(content, str) else content
+
                     # Text content means response has started - emit accumulated thinking first
                     # Use invocation_id as key for parallel subagent support
                     agent = self._current_agent
@@ -272,6 +278,9 @@ class LangGraphEventMapper:
             # Track this tool as active
             self._active_tools.add(tool_name)
 
+            # Increment sequence number for timeline ordering
+            self._tool_sequence += 1
+
             # Create human-readable description
             tool_description = self._get_tool_description(tool_name, tool_input)
 
@@ -286,6 +295,8 @@ class LangGraphEventMapper:
                 details=tool_description,
                 timestamp=timestamp,
                 invocation_id=invocation_id,
+                sequence_number=self._tool_sequence,  # For timeline ordering
+                description=tool_description,  # AI-readable description for active indicator
             )
             self.agent_trace.append(activity)
             sse_events.append(
@@ -311,6 +322,26 @@ class LangGraphEventMapper:
             else:
                 result_summary = self._summarize_tool_result(tool_name, output)
 
+            # Also emit as agent_activity with "tool_complete" action for inline tool timeline
+            # This allows the frontend to show tool completion in the inline timeline
+            sse_events.append(
+                SSEEvent(
+                    event=SSEEventType.AGENT_ACTIVITY,
+                    data=AgentActivityData(
+                        agent=self._current_agent,
+                        action="tool_complete",
+                        tool_name=tool_name,
+                        timestamp=timestamp,
+                        invocation_id=invocation_id,
+                        result_summary=result_summary,
+                        success=tool_success,
+                        # Include sanitized result details for expanded view (truncated for safety)
+                        result_details=make_json_serializable(output) if output and not isinstance(output, str) or (isinstance(output, str) and len(output) < 5000) else None,
+                    ),
+                )
+            )
+
+            # Keep the legacy TOOL_RESULT event for backwards compatibility
             sse_events.append(
                 SSEEvent(
                     event=SSEEventType.TOOL_RESULT,
@@ -523,9 +554,18 @@ class LangGraphEventMapper:
             return "No result"
 
         if isinstance(result, str):
+            # Handle raw JSON strings (common with MCP tool results)
+            if result.startswith('{"') or result.startswith('['):
+                try:
+                    import json
+                    parsed = json.loads(result)
+                    return self._summarize_tool_result(tool_name, parsed)
+                except (json.JSONDecodeError, ValueError):
+                    pass
             return result[:200] if len(result) > 200 else result
 
         if isinstance(result, dict):
+            # Knowledge graph tools
             if tool_name == "query_graph":
                 count = result.get("count", 0)
                 return f"Query returned {count} results"
@@ -536,8 +576,77 @@ class LangGraphEventMapper:
             elif tool_name == "search_text":
                 count = result.get("count", 0)
                 return f"Found {count} text chunks"
+
+            # Firecrawl web research tools
+            elif tool_name == "firecrawl_search":
+                results = result.get("results") or result.get("data", [])
+                if isinstance(results, list):
+                    count = len(results)
+                    # Extract first result title for context
+                    if count > 0 and isinstance(results[0], dict):
+                        title = results[0].get("title", "")[:50]
+                        return f"Found {count} web results" + (f": {title}..." if title else "")
+                    return f"Found {count} web results"
+                return "Web search completed"
+
+            elif tool_name == "firecrawl_scrape":
+                # Scrape returns page content
+                title = result.get("title") or result.get("metadata", {}).get("title", "")
+                url = result.get("url", "")
+                if title:
+                    return f"Scraped: {title[:60]}..."
+                elif url:
+                    return f"Scraped page: {url[:60]}..."
+                return "Page scraped successfully"
+
+            elif tool_name == "firecrawl_map":
+                # Map returns list of URLs on a site
+                urls = result.get("urls") or result.get("links", [])
+                if isinstance(urls, list):
+                    return f"Found {len(urls)} URLs on site"
+                return "Site map retrieved"
+
+            elif tool_name == "firecrawl_extract":
+                # Extract returns structured data
+                data = result.get("data") or result.get("extracted", {})
+                if isinstance(data, dict):
+                    keys = list(data.keys())[:3]
+                    return f"Extracted: {', '.join(keys)}..." if keys else "Data extracted"
+                return "Structured data extracted"
+
+            # Mentor Hub tools
+            elif tool_name == "get_mentor_hub_sessions":
+                sessions = result.get("sessions", [])
+                return f"Found {len(sessions)} sessions"
+
+            elif tool_name == "get_mentor_hub_tasks":
+                tasks = result.get("tasks", [])
+                return f"Found {len(tasks)} tasks"
+
+            elif tool_name == "search_mentor_hub_mentors":
+                mentors = result.get("mentors", [])
+                return f"Found {len(mentors)} mentors"
+
+            elif tool_name == "get_mentor_hub_team":
+                name = result.get("name", "")
+                if name:
+                    return f"Team: {name}"
+                return "Team details retrieved"
+
+            # Generic results handling
             elif "results" in result:
                 return f"Found {len(result['results'])} results"
+            elif "data" in result and isinstance(result["data"], list):
+                return f"Retrieved {len(result['data'])} items"
+            elif "content" in result:
+                content = result["content"]
+                if isinstance(content, str) and len(content) > 100:
+                    return f"Retrieved content ({len(content)} chars)"
+                return "Content retrieved"
+
+        # List results
+        if isinstance(result, list):
+            return f"Retrieved {len(result)} items"
 
         return str(result)[:200]
 

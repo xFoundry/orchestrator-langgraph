@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import traceback
 import uuid
 from typing import AsyncGenerator
@@ -24,6 +25,18 @@ from app.utils.thread_title import generate_thread_title
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
+
+# Heartbeat interval in seconds - keeps SSE connection alive during long tool operations
+HEARTBEAT_INTERVAL_SECONDS = 15
+
+
+def create_heartbeat_event() -> str:
+    """Create a heartbeat SSE event to keep the connection alive."""
+    event = SSEEvent(
+        event=SSEEventType.HEARTBEAT,
+        data={"timestamp": time.time()},
+    )
+    return event.to_sse_string()
 
 
 async def sse_event_generator(
@@ -166,20 +179,76 @@ async def sse_event_generator(
             # V1/V2 use simple message format
             input_state = {"messages": [{"role": "user", "content": message}]}
 
-        # Stream events from orchestrator
-        async for event in graph.astream_events(
-            input_state,
-            config=config,
-            version="v2",
-        ):
-            # Map LangGraph event to SSE events
-            sse_events = mapper.map_event(event)
+        # Stream events from orchestrator with heartbeat to keep connection alive
+        # Use an async queue to merge events from the orchestrator and heartbeat task
+        event_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        stream_done = asyncio.Event()
 
-            for sse_event in sse_events:
-                yield sse_event.to_sse_string()
+        async def heartbeat_task():
+            """Send periodic heartbeats to prevent connection timeout."""
+            while not stream_done.is_set():
+                try:
+                    await asyncio.wait_for(
+                        stream_done.wait(),
+                        timeout=HEARTBEAT_INTERVAL_SECONDS
+                    )
+                    # stream_done was set, exit the loop
+                    break
+                except asyncio.TimeoutError:
+                    # Timeout means we should send a heartbeat
+                    await event_queue.put(create_heartbeat_event())
+                    logger.debug("Sent heartbeat event")
 
-            # Allow other tasks to run
-            await asyncio.sleep(0)
+        async def stream_events_task():
+            """Stream events from the orchestrator into the queue."""
+            try:
+                async for event in graph.astream_events(
+                    input_state,
+                    config=config,
+                    version="v2",
+                ):
+                    # Map LangGraph event to SSE events
+                    sse_events = mapper.map_event(event)
+
+                    for sse_event in sse_events:
+                        await event_queue.put(sse_event.to_sse_string())
+
+                    # Allow other tasks to run
+                    await asyncio.sleep(0)
+            finally:
+                # Signal that streaming is done
+                stream_done.set()
+                await event_queue.put(None)  # Sentinel to stop the consumer
+
+        # Start both tasks
+        heartbeat = asyncio.create_task(heartbeat_task())
+        stream = asyncio.create_task(stream_events_task())
+
+        try:
+            # Consume events from the queue
+            while True:
+                event_str = await event_queue.get()
+                if event_str is None:
+                    break
+                yield event_str
+        finally:
+            # Clean up tasks
+            stream_done.set()
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
+            # Wait for stream task if not done
+            if not stream.done():
+                try:
+                    await asyncio.wait_for(stream, timeout=1.0)
+                except asyncio.TimeoutError:
+                    stream.cancel()
+                    try:
+                        await stream
+                    except asyncio.CancelledError:
+                        pass
 
         # Generate AI title for new threads after first response
         try:

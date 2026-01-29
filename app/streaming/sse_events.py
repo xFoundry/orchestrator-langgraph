@@ -29,12 +29,20 @@ class AgentActivityData(BaseModel):
     """Data for agent_activity events."""
 
     agent: str
-    action: str  # "tool_call", "tool_response", "delegate", "thinking"
+    action: str  # "tool_call", "tool_response", "delegate", "thinking", "completed"
     tool_name: Optional[str] = None
     tool_args: Optional[dict[str, Any]] = None
     details: Optional[str] = None
     timestamp: Optional[float] = None
     invocation_id: Optional[str] = None  # Unique ID for parallel subagent tracking
+
+    # NEW: Enhanced fields for inline tool UX
+    display_name: Optional[str] = None  # AI-generated name: "Web Researcher – Social Media Audit"
+    description: Optional[str] = None  # AI-generated description for active tool indicator
+    sequence_number: Optional[int] = None  # For timeline ordering
+    result_summary: Optional[str] = None  # Human-readable result for completed tools
+    result_details: Optional[Any] = None  # Full result for expanded view
+    success: Optional[bool] = None  # Tool success status
 
 
 class TextChunkData(BaseModel):
@@ -108,6 +116,10 @@ class TodoData(BaseModel):
 
     todos: list[TodoItemData]
     timestamp: Optional[float] = None
+
+    # NEW: Fields for grouping todos by owning agent in progress panel
+    agent: Optional[str] = None  # Display name of owning agent
+    invocation_id: Optional[str] = None  # For grouping in progress panel
 
 
 class ArtifactData(BaseModel):

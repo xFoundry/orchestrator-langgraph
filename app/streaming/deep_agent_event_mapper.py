@@ -85,8 +85,11 @@ class DeepAgentEventMapper(LangGraphEventMapper):
 
         Priority:
         1. Direct run_id match in _run_to_invocation
-        2. Parent run context from metadata
-        3. Current invocation_id (fallback)
+        2. Config metadata (injected when subagent is invoked)
+        3. Parent invocation from metadata
+        4. Parent run context from checkpoint_ns or parent_ids
+        5. Match by agent name from active subagents stack
+        6. Current invocation_id (fallback)
 
         Returns:
             The invocation_id for this event, or None if not in subagent context
@@ -94,23 +97,33 @@ class DeepAgentEventMapper(LangGraphEventMapper):
         run_id = event.get("run_id") or event.get("data", {}).get("run_id")
         metadata = event.get("metadata", {})
 
-        # Try direct run_id lookup
+        # Priority 1: Direct run_id lookup
         if run_id and run_id in self._run_to_invocation:
             return self._run_to_invocation[run_id]
 
-        # Try to find parent run context from checkpoint_ns or parent_ids
+        # Priority 2: Config metadata (injected by execute_subagent)
+        # This is the key fix for parallel subagent event routing
+        configurable = metadata.get("configurable", {})
+        if configurable.get("invocation_id"):
+            return configurable["invocation_id"]
+
+        # Priority 3: Parent invocation from metadata (set when delegating)
+        if metadata.get("parent_invocation_id"):
+            return metadata["parent_invocation_id"]
+
+        # Priority 4: Try to find parent run context from checkpoint_ns or parent_ids
         parent_ids = metadata.get("parent_ids", [])
         for parent_id in parent_ids:
             if parent_id in self._run_to_invocation:
                 return self._run_to_invocation[parent_id]
 
-        # Try matching by agent name from active subagents
+        # Priority 5: Try matching by agent name from active subagents
         agent_name = self._get_agent_name(event)
         for subagent in reversed(self._active_subagents):
             if subagent.get("name") == agent_name:
                 return subagent.get("invocation_id")
 
-        # Fallback to current invocation_id
+        # Priority 6: Fallback to current invocation_id
         return self._current_invocation_id
 
     def _log_sse_events(self, events: list[SSEEvent]) -> list[SSEEvent]:
@@ -240,12 +253,23 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                     )
                     for i, todo in enumerate(todos)
                 ]
+
+                # Get the invocation_id for proper grouping in progress panel
+                # This fixes the issue where write_todos from subagents fell into "Planner" bucket
+                invocation_id = self._get_invocation_id_for_event(event)
+
+                # Determine the owning agent - use current agent context
+                # For subagents, this will be the subagent name; for orchestrator, it's "Planner"
+                owning_agent = self._current_agent if self._active_subagents else "Planner"
+
                 sse_events.append(
                     SSEEvent(
                         event=SSEEventType.TODO,
                         data=TodoData(
                             todos=todo_items,
                             timestamp=timestamp,
+                            agent=owning_agent,
+                            invocation_id=invocation_id,
                         ),
                     )
                 )
@@ -275,6 +299,15 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                 if not subagent_name:
                     subagent_name = "assistant"
 
+                # NEW: Get AI-generated display_name if provided, otherwise generate one
+                # Format: "Role – Concise task description"
+                display_name = tool_input.get("display_name")
+                if not display_name:
+                    # Generate display_name from subagent_name and task description
+                    role_name = self._get_readable_agent_name(subagent_name)
+                    task_summary = self._summarize_task_description(task_description)
+                    display_name = f"{role_name} – {task_summary}" if task_summary else role_name
+
                 # Generate unique invocation ID for this delegation
                 # Format: {sanitized_name}_{short_uuid} to enable parallel same-agent tracking
                 # Sanitize to ensure only alphanumeric, underscore, hyphen (safe for JSON/Redis)
@@ -298,6 +331,7 @@ class DeepAgentEventMapper(LangGraphEventMapper):
                             details=safe_details,
                             timestamp=timestamp,
                             invocation_id=invocation_id,
+                            display_name=display_name,  # NEW: AI-generated or inferred name
                         ),
                     )
                 )
@@ -568,7 +602,9 @@ class DeepAgentEventMapper(LangGraphEventMapper):
 
         # If we're in a subagent namespace and the node is "tools" or "model",
         # attribute to the subagent, not orchestrator
-        if subagent_from_ns and name in ("tools", "model", "agent"):
+        # IMPORTANT: Only if we actually have active subagents - after subagent completion,
+        # the checkpoint_ns might still reference the subagent path, but we should attribute to orchestrator
+        if subagent_from_ns and name in ("tools", "model", "agent") and self._active_subagents:
             return subagent_from_ns
 
         # Direct subagent node match
@@ -657,3 +693,83 @@ class DeepAgentEventMapper(LangGraphEventMapper):
 
         # Default to assistant for general tasks
         return "assistant"
+
+    def _get_readable_agent_name(self, agent_name: str) -> str:
+        """
+        Convert internal agent name to a human-readable display name.
+
+        Examples:
+        - "web_researcher" -> "Web Researcher"
+        - "integration_expert" -> "Integration Expert"
+        - "research-agent" -> "Research Agent"
+        """
+        readable_names = {
+            "web_researcher": "Web Researcher",
+            "research_expert": "Research Expert",
+            "integration_expert": "Integration Expert",
+            "mentor_matcher": "Mentor Matcher",
+            "data_analyst": "Data Analyst",
+            "developer": "Developer",
+            "writer": "Writer",
+            "assistant": "Assistant",
+            "research-agent": "Research Agent",
+            "web-researcher": "Web Researcher",
+            "mentor-matcher": "Mentor Matcher",
+            "integration-agent": "Integration Agent",
+            "general-purpose": "General Purpose",
+        }
+
+        if agent_name in readable_names:
+            return readable_names[agent_name]
+
+        # Convert snake_case or kebab-case to Title Case
+        # Replace underscores and hyphens with spaces, then title case
+        return agent_name.replace("_", " ").replace("-", " ").title()
+
+    def _summarize_task_description(self, task_description: str, max_length: int = 50) -> str:
+        """
+        Create a concise summary of a task description for display.
+
+        Extracts the key action/topic from the task description.
+        Returns an empty string if the description is empty or unhelpful.
+        """
+        if not task_description:
+            return ""
+
+        # Clean up the description
+        desc = task_description.strip()
+
+        # Remove common prefixes that don't add value
+        prefixes_to_remove = [
+            "please ",
+            "can you ",
+            "i need you to ",
+            "i want you to ",
+            "your task is to ",
+            "you should ",
+        ]
+        desc_lower = desc.lower()
+        for prefix in prefixes_to_remove:
+            if desc_lower.startswith(prefix):
+                desc = desc[len(prefix):]
+                break
+
+        # Take the first sentence or clause
+        for sep in [". ", ".\n", " - ", ": ", "\n"]:
+            if sep in desc:
+                desc = desc.split(sep)[0]
+                break
+
+        # Truncate to max length, breaking at word boundary
+        if len(desc) > max_length:
+            desc = desc[:max_length]
+            # Find last space to avoid cutting words
+            last_space = desc.rfind(" ")
+            if last_space > max_length // 2:
+                desc = desc[:last_space]
+
+        # Capitalize first letter
+        if desc:
+            desc = desc[0].upper() + desc[1:]
+
+        return desc.strip()
